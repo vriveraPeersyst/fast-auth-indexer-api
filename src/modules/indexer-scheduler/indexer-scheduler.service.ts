@@ -1,5 +1,5 @@
 import { Injectable, Logger } from "@nestjs/common";
-import { Cron, CronExpression } from "@nestjs/schedule";
+import { Cron } from "@nestjs/schedule";
 
 import { IndexerRunResult } from "../common/indexer-run-result";
 import { FastauthContractStateService } from "../fastauth-contract-state/fastauth-contract-state.service";
@@ -26,10 +26,21 @@ type Task = "near-ingest" | "health-fastauth" | "health-consumer" | "health-user
  * Errors are caught and logged; the scheduler never crashes the worker
  * process so one failing source doesn't kill the others.
  */
+/**
+ * Maximum number of indexer tasks that may run concurrently. The old worker's
+ * `Promise.all([...7 collectors])` strictly serialized cycles. With cron-based
+ * scheduling we lose that natural backpressure, so the cap is defense-in-depth
+ * against future leaks. Cap is generous (5) because the dominant memory cost —
+ * loading every distinct FA pubkey/account into memory — is now eliminated
+ * (see `near-ingest.service.ts:probePubKeys/probeAccounts`).
+ */
+const MAX_INFLIGHT_TASKS = 5;
+
 @Injectable()
 export class IndexerSchedulerService {
     private readonly logger = new Logger(IndexerSchedulerService.name);
     private readonly running = new Map<Task, boolean>();
+    private inFlight = 0;
 
     constructor(
         private readonly nearIngest: NearIngestService,
@@ -41,37 +52,42 @@ export class IndexerSchedulerService {
         private readonly contractState: FastauthContractStateService,
     ) {}
 
-    @Cron(CronExpression.EVERY_30_SECONDS, { name: "near-ingest" })
+    // Cron schedules are staggered by 5s within each 30s window so the heavy
+    // task (near-ingest) doesn't compete with the 4 fast tasks for cap slots.
+    // Without staggering, all 30s tasks fire at the same instant and the
+    // alphabetically/registration-order-last task gets perpetually starved.
+
+    @Cron("0,30 * * * * *", { name: "near-ingest" })
     async tickNearIngest(): Promise<void> {
         await this.runWithLock("near-ingest", () => this.nearIngest.runOnce());
     }
 
-    @Cron(CronExpression.EVERY_30_SECONDS, { name: "health-fastauth" })
+    @Cron("5,35 * * * * *", { name: "health-fastauth" })
     async tickFastauthHealth(): Promise<void> {
         await this.runWithLock("health-fastauth", () => this.fastauthHealth.runOnce());
     }
 
-    @Cron(CronExpression.EVERY_30_SECONDS, { name: "health-consumer" })
+    @Cron("10,40 * * * * *", { name: "health-consumer" })
     async tickConsumerHealth(): Promise<void> {
         await this.runWithLock("health-consumer", () => this.consumerHealth.runOnce());
     }
 
-    @Cron(CronExpression.EVERY_30_SECONDS, { name: "health-user" })
+    @Cron("15,45 * * * * *", { name: "health-user" })
     async tickUserHealth(): Promise<void> {
         await this.runWithLock("health-user", () => this.userHealth.runOnce());
     }
 
-    @Cron(CronExpression.EVERY_30_SECONDS, { name: "mpc-consensus" })
+    @Cron("20,50 * * * * *", { name: "mpc-consensus" })
     async tickMpc(): Promise<void> {
         await this.runWithLock("mpc-consensus", () => this.mpc.runOnce());
     }
 
-    @Cron(CronExpression.EVERY_MINUTE, { name: "pka" })
+    @Cron("25 * * * * *", { name: "pka" })
     async tickPka(): Promise<void> {
         await this.runWithLock("pka", () => this.pka.runOnce());
     }
 
-    @Cron(CronExpression.EVERY_5_MINUTES, { name: "contract-state" })
+    @Cron("0 */5 * * * *", { name: "contract-state" })
     async tickContractState(): Promise<void> {
         await this.runWithLock("contract-state", () => this.contractState.runOnce());
     }
@@ -81,7 +97,12 @@ export class IndexerSchedulerService {
             this.logger.warn(`${task} still running from previous tick; skipping this cycle`);
             return null;
         }
+        if (this.inFlight >= MAX_INFLIGHT_TASKS) {
+            this.logger.warn(`${task} skipped: ${this.inFlight} tasks already in flight (cap=${MAX_INFLIGHT_TASKS})`);
+            return null;
+        }
         this.running.set(task, true);
+        this.inFlight += 1;
         try {
             const result = await fn();
             const summary = `status=${result.status}` + (result.inserted != null ? ` inserted=${result.inserted}` : "");
@@ -96,6 +117,7 @@ export class IndexerSchedulerService {
             return null;
         } finally {
             this.running.set(task, false);
+            this.inFlight = Math.max(0, this.inFlight - 1);
         }
     }
 }

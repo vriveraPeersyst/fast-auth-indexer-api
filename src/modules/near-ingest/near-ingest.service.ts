@@ -1,7 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
-import { IsNull, Not, Repository } from "typeorm";
+import { Repository } from "typeorm";
 
 import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -54,9 +54,13 @@ type MpcTxRow = Partial<MpcTransaction>;
  *   1. Fetch latest final block, persist chain-head checkpoint.
  *   2. Determine `[startHeight, targetHeight]` range from forward checkpoints,
  *      capped at NEAR_MAX_BLOCKS_PER_RUN.
- *   3. Load FastAuth pubkey set + FastAuth account set + token registry once.
+ *   3. Load token registry once. Pubkey/account membership is probed
+ *      per-block (bounded by candidates), not loaded all-time upfront —
+ *      see `probePubKeys` / `probeAccounts`.
  *   4. Walk each height concurrently:
  *      - Fetch block + chunks via NEAR RPC pool.
+ *      - Pre-extract candidate pubkeys/accounts referenced in this block,
+ *        probe DB for which exist (one query each, scoped to candidates).
  *      - For every tx, classify against 4 disjoint paths:
  *          Path 1 — receiver in FA contract set       → near_transactions + sign-event seeds
  *          Path 2 — Delegate signed by FA-derived key → fastauth_consumer_transactions
@@ -127,9 +131,15 @@ export class NearIngestService {
             );
 
             const fastAuthContractSet = new Set(this.fastAuthContractIds);
-            const fastAuthPubKeySet = await this.loadFastAuthPubKeySet();
-            const fastAuthAccountSet = await this.loadFastAuthAccountSet();
             const tokenRegistry = await this.pricing.refresh().catch(() => null);
+
+            // Tracks pubkeys discovered inline by Path 1 across the entire
+            // 500-block batch — so a consumer tx (Path 2) landing N blocks
+            // after its producing sign event can still match. Bounded by new
+            // sign events in this window (single-digit dozens, typically),
+            // GC'd after runOnce() returns. Replaces the old all-time
+            // fastAuthPubKeySet which scaled with all-time history.
+            const batchInlinePubKeys = new Set<string>();
 
             const stats = {
                 processed: 0,
@@ -155,8 +165,7 @@ export class NearIngestService {
                         latestHeight,
                         latestPayload,
                         fastAuthContractSet,
-                        fastAuthPubKeySet,
-                        fastAuthAccountSet,
+                        batchInlinePubKeys,
                         tokenRegistry,
                         stats,
                         completedHeights,
@@ -240,37 +249,49 @@ export class NearIngestService {
         return { startHeight, targetHeight };
     }
 
-    private async loadFastAuthPubKeySet(): Promise<Set<string>> {
-        const set = new Set<string>();
+    /**
+     * Per-block bounded membership probe for FastAuth-derived pubkeys.
+     * Replaces the old all-time `loadFastAuthPubKeySet()` which loaded every
+     * distinct pubkey from `fastauth_sign_events` into memory each cycle —
+     * the dominant heap-pressure source that OOM'd the legacy worker.
+     *
+     * `candidates` is the small set of inner-pubkeys actually referenced by
+     * the current block's txs (typically tens, not hundreds of thousands).
+     * The query returns only the subset that matches a known sign event.
+     */
+    private async probePubKeys(candidates: string[]): Promise<Set<string>> {
+        if (candidates.length === 0) return new Set();
         try {
-            const rows = await this.signEventRepository
-                .createQueryBuilder("e")
-                .select("DISTINCT e.user_derived_public_key", "pk")
-                .where({ userDerivedPublicKey: Not(IsNull()) })
-                .getRawMany<{ pk: string | null }>();
-            for (const row of rows) {
-                if (row.pk) set.add(row.pk);
-            }
+            const rows = await this.signEventRepository.query<Array<{ pk: string }>>(
+                `SELECT DISTINCT user_derived_public_key AS pk
+                 FROM fastauth_sign_events
+                 WHERE user_derived_public_key = ANY($1)`,
+                [candidates],
+            );
+            return new Set(rows.map((r) => r.pk));
         } catch {
-            // best-effort
+            return new Set();
         }
-        return set;
     }
 
-    private async loadFastAuthAccountSet(): Promise<Set<string>> {
-        const set = new Set<string>();
+    /**
+     * Per-block bounded membership probe for FastAuth account ids. Replaces
+     * the old all-time `loadFastAuthAccountSet()`. `candidates` is the union
+     * of (block tx signers, delegate inner senders) — typically tens.
+     */
+    private async probeAccounts(candidates: string[]): Promise<Set<string>> {
+        if (candidates.length === 0) return new Set();
         try {
-            const rows = await this.pkaRepository
-                .createQueryBuilder("p")
-                .select("DISTINCT p.account_id", "accountId")
-                .getRawMany<{ accountId: string | null }>();
-            for (const row of rows) {
-                if (row.accountId) set.add(row.accountId.trim().toLowerCase());
-            }
+            const rows = await this.pkaRepository.query<Array<{ account_id: string }>>(
+                `SELECT DISTINCT account_id
+                 FROM fastauth_public_key_accounts
+                 WHERE account_id = ANY($1)`,
+                [candidates],
+            );
+            return new Set(rows.map((r) => r.account_id.trim().toLowerCase()));
         } catch {
-            // best-effort
+            return new Set();
         }
-        return set;
     }
 
     private async processBlockHeight(params: {
@@ -278,8 +299,7 @@ export class NearIngestService {
         latestHeight: number;
         latestPayload: NearBlockResponse;
         fastAuthContractSet: Set<string>;
-        fastAuthPubKeySet: Set<string>;
-        fastAuthAccountSet: Set<string>;
+        batchInlinePubKeys: Set<string>;
         tokenRegistry: TokenRegistry | null;
         stats: {
             processed: number;
@@ -331,6 +351,41 @@ export class NearIngestService {
             chunkPayloads[idx] = await this.nearBlock.fetchChunkByHash(chunkHash);
         });
 
+        // Pre-extract the candidate pubkeys/accounts this block's txs reference,
+        // then probe the DB once per block. Bounds memory to ~tens of strings
+        // per block instead of all-time history (the legacy worker's leak).
+        const candidatePubKeys = new Set<string>();
+        const candidateAccounts = new Set<string>();
+        for (const chunkPayload of chunkPayloads) {
+            const txs = chunkPayload?.result?.transactions ?? [];
+            for (const tx of txs) {
+                if (tx.signer_id) candidateAccounts.add(tx.signer_id.trim().toLowerCase());
+                const delegateInfo = extractDelegateActionInfo(tx.actions);
+                if (delegateInfo) {
+                    candidatePubKeys.add(delegateInfo.innerPublicKey);
+                    if (delegateInfo.innerSignerId) candidateAccounts.add(delegateInfo.innerSignerId.trim().toLowerCase());
+                }
+            }
+        }
+
+        const [dbKnownPubKeys, dbKnownAccounts] = await Promise.all([
+            this.probePubKeys([...candidatePubKeys]),
+            this.probeAccounts([...candidateAccounts]),
+        ]);
+
+        // Effective sets for THIS block: DB-known ∪ batch-level inline
+        // discoveries from earlier blocks in this same cycle. Path 1 may
+        // mutate `effectivePubKeySet` mid-classification (inline discovery),
+        // and we propagate those additions back to `batchInlinePubKeys` after
+        // the block finishes so subsequent blocks of this batch can see them.
+        const effectivePubKeySet = new Set<string>(dbKnownPubKeys);
+        const effectiveAccountSet = new Set<string>(dbKnownAccounts);
+        for (const pk of params.batchInlinePubKeys) {
+            if (candidatePubKeys.has(pk)) effectivePubKeySet.add(pk);
+        }
+
+        const inlineDiscoveriesThisBlock = new Set<string>();
+
         for (const chunkPayload of chunkPayloads) {
             const txs = chunkPayload?.result?.transactions ?? [];
             for (const tx of txs) {
@@ -339,8 +394,9 @@ export class NearIngestService {
                     blockHeight,
                     blockTimestamp,
                     fastAuthContractSet: params.fastAuthContractSet,
-                    fastAuthPubKeySet: params.fastAuthPubKeySet,
-                    fastAuthAccountSet: params.fastAuthAccountSet,
+                    fastAuthPubKeySet: effectivePubKeySet,
+                    fastAuthAccountSet: effectiveAccountSet,
+                    inlinePubKeyDiscoveries: inlineDiscoveriesThisBlock,
                     tokenRegistry: params.tokenRegistry,
                     uniqueTransactions,
                     uniqueSignEvents,
@@ -350,6 +406,8 @@ export class NearIngestService {
                 });
             }
         }
+
+        for (const pk of inlineDiscoveriesThisBlock) params.batchInlinePubKeys.add(pk);
 
         const insertResult = await this.persistBlock({
             transactions: [...uniqueTransactions.values()],
@@ -395,6 +453,7 @@ export class NearIngestService {
         fastAuthContractSet: Set<string>;
         fastAuthPubKeySet: Set<string>;
         fastAuthAccountSet: Set<string>;
+        inlinePubKeyDiscoveries: Set<string>;
         tokenRegistry: TokenRegistry | null;
         uniqueTransactions: Map<string, NearTxRow>;
         uniqueSignEvents: Map<string, FastAuthSignEventSeed>;
@@ -446,9 +505,14 @@ export class NearIngestService {
                 params.uniqueSignEvents.set(`${seed.txHash}:${seed.actionIndex}`, seed);
             }
 
-            // Grow the in-memory pubkey set inline so consumer txs landing
-            // 1-5 blocks later in this same iteration are matched immediately.
-            for (const pk of inlinePublicKeys) params.fastAuthPubKeySet.add(pk);
+            // Grow the per-block effective set inline so consumer txs in
+            // later txs of the SAME block match this Path 1 sign event.
+            // Track discoveries separately so processBlockHeight can
+            // propagate them to the batch-level set for cross-block matching.
+            for (const pk of inlinePublicKeys) {
+                params.fastAuthPubKeySet.add(pk);
+                params.inlinePubKeyDiscoveries.add(pk);
+            }
         }
 
         // Path 2 — Delegate signed by FA-derived key

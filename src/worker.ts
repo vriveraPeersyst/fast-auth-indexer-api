@@ -28,6 +28,22 @@ async function bootstrap(): Promise<void> {
     });
     app.useLogger(logger);
     app.enableShutdownHooks();
+
+    // Observe unhandled rejections so V8 can GC their captured closures
+    // (otherwise a swallowed RPC error retains its body buffer indefinitely).
+    process.on("unhandledRejection", (reason) => {
+        logger.error(`unhandledRejection: ${reason instanceof Error ? reason.stack : String(reason)}`);
+    });
+
+    // Periodic heap snapshot — makes the next OOM a 30s diagnosis, not 3 days
+    // of forensics. rss is what Railway's container-memory metric reports.
+    const memInterval = setInterval(() => {
+        const m = process.memoryUsage();
+        const fmt = (n: number): string => `${Math.round(n / 1024 / 1024)}MB`;
+        logger.log(`mem rss=${fmt(m.rss)} heapUsed=${fmt(m.heapUsed)} heapTotal=${fmt(m.heapTotal)} external=${fmt(m.external)}`);
+    }, 60_000);
+    memInterval.unref();
+
     logger.log("Indexer worker started; cron schedulers active.");
 }
 bootstrap();

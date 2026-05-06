@@ -19,7 +19,7 @@
         "cli": "env-cmd --silent ts-node ./src/cli.ts",
         "cli:prod": "node ./dist/src/cli.js",
         "worker": "env-cmd --silent ts-node ./src/worker.ts",
-        "worker:prod": "node ./dist/src/worker.js",
+        "worker:prod": "node --max-old-space-size=2048 ./dist/src/worker.js",
         "lint": "eslint . --ext .ts,.json",
         "lint:fix": "prettier --config .prettierrc '**/*.{json,ts}' --write && eslint . --ext .ts,.json --fix",
         "test": "jest",

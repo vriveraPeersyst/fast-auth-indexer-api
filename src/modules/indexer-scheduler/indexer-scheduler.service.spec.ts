@@ -101,6 +101,33 @@ describe("IndexerSchedulerService", () => {
         expect(nearIngest.runOnce).toHaveBeenCalledTimes(2);
     });
 
+    it("rejects new tasks once MAX_INFLIGHT_TASKS is reached (global concurrency cap)", async () => {
+        // Hold five tasks open (the cap) so a sixth must be rejected.
+        const gates: Array<(v: IndexerRunResult) => void> = [];
+        const inflight = (): Promise<IndexerRunResult> => new Promise((resolve) => gates.push(resolve));
+
+        nearIngest.runOnce.mockReturnValueOnce(inflight());
+        fastauthHealth.runOnce.mockReturnValueOnce(inflight());
+        consumerHealth.runOnce.mockReturnValueOnce(inflight());
+        userHealth.runOnce.mockReturnValueOnce(inflight());
+        mpc.runOnce.mockReturnValueOnce(inflight());
+
+        const t1 = scheduler.tickNearIngest();
+        const t2 = scheduler.tickFastauthHealth();
+        const t3 = scheduler.tickConsumerHealth();
+        const t4 = scheduler.tickUserHealth();
+        const t5 = scheduler.tickMpc();
+
+        // Sixth task must be skipped because five are already in flight.
+        const skipped = await scheduler.runWithLock("pka", () => Promise.resolve({ source: "x", status: "ok" }));
+        expect(skipped).toBeNull();
+        expect(pka.runOnce).not.toHaveBeenCalled();
+
+        // Drain so we don't leak unresolved promises across tests.
+        gates.forEach((g) => g({ source: "x", status: "ok" }));
+        await Promise.all([t1, t2, t3, t4, t5]);
+    });
+
     it("logs error-status results without throwing", async () => {
         nearIngest.runOnce.mockResolvedValue({ source: "near-ingest", status: "error", details: "RPC pool exhausted" });
         await expect(scheduler.tickNearIngest()).resolves.toBeUndefined();

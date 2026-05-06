@@ -75,6 +75,7 @@ describe("NearIngestService", () => {
         mpcTxRepo = repoFactory();
         pkaRepo = {
             createQueryBuilder: jest.fn(() => makeSelectQbMock([])),
+            query: jest.fn().mockResolvedValue([]),
         };
         checkpoints = { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue(undefined) };
         nearBlock = {
@@ -327,8 +328,8 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        // Populate FA account set with the signer.
-        pkaRepo.createQueryBuilder = jest.fn(() => makeSelectQbMock([{ accountId: "alice.near" }]));
+        // Probe returns the signer as a known FA account.
+        pkaRepo.query.mockResolvedValue([{ account_id: "alice.near" }]);
         nearBlock.fetchChunkByHash.mockResolvedValue({
             result: {
                 transactions: [
@@ -361,7 +362,7 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        pkaRepo.createQueryBuilder = jest.fn(() => makeSelectQbMock([{ accountId: "alice.near" }]));
+        pkaRepo.query.mockResolvedValue([{ account_id: "alice.near" }]);
         nearBlock.fetchChunkByHash.mockResolvedValue({
             result: {
                 transactions: [
@@ -405,12 +406,8 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        // Populate pubkey set to enable consumer path
-        const pubKeyQb = makeSelectQbMock([{ pk: "ed25519:user-key" }]);
-        signEventRepo.createQueryBuilder = jest.fn((alias?: string) => {
-            if (alias === "e") return pubKeyQb;
-            return makeInsertQbMock();
-        });
+        // Probe for FA pubkeys returns the inner public key as known.
+        signEventRepo.query.mockResolvedValue([{ pk: "ed25519:user-key" }]);
         nearBlock.fetchChunkByHash.mockResolvedValue({
             result: {
                 transactions: [
@@ -436,6 +433,7 @@ describe("NearIngestService", () => {
                 ],
             },
         });
+        // First query call is the probe (returns pubkeys), second is the linker UPDATE.
         consumerRepo.query.mockResolvedValue({ rowsAffected: 3 } as any);
 
         const result = await service.runOnce();
@@ -455,11 +453,7 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        const pubKeyQb = makeSelectQbMock([{ pk: "ed25519:user-key" }]);
-        signEventRepo.createQueryBuilder = jest.fn((alias?: string) => {
-            if (alias === "e") return pubKeyQb;
-            return makeInsertQbMock();
-        });
+        signEventRepo.query.mockResolvedValue([{ pk: "ed25519:user-key" }]);
         nearBlock.fetchChunkByHash.mockResolvedValue({
             result: {
                 transactions: [
@@ -525,7 +519,7 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        pkaRepo.createQueryBuilder = jest.fn(() => makeSelectQbMock([{ accountId: "alice.near" }]));
+        pkaRepo.query.mockResolvedValue([{ account_id: "alice.near" }]);
         // Pricing returns priced tokens
         pricing.computeActionsValue.mockReturnValue({
             totalUsd: 12.34,
@@ -567,7 +561,7 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        pkaRepo.createQueryBuilder = jest.fn(() => makeSelectQbMock([{ accountId: "alice.near" }]));
+        pkaRepo.query.mockResolvedValue([{ account_id: "alice.near" }]);
         pricing.computeActionsValue.mockReturnValue({
             totalUsd: 99.5,
             tokens: [{ symbol: "USDC", decimals: 6, rawAmount: "99500000", valueUsd: 99.5 }],
