@@ -1,0 +1,33 @@
+# Railway repo-level config (shared by every service that builds from this repo).
+# https://docs.railway.com/reference/config-as-code
+#
+# Two services deploy from this same source tree, both referencing the same
+# Postgres via DATABASE_URL = ${{fast-auth-indexer-api-DB.DATABASE_URL}}:
+#
+#   1. fast-auth-indexer-api-api      (HTTP read API)
+#        Settings → Deploy → Custom Start Command:  pnpm run start:prod
+#        Settings → Deploy → Healthcheck Path:      /api/health
+#
+#   2. fast-auth-indexer-api-worker   (long-running indexer)
+#        Settings → Deploy → Custom Start Command:  pnpm run worker:prod
+#        Settings → Deploy → Healthcheck Path:      (leave empty — no HTTP surface)
+#
+# IMPORTANT: this file does NOT define [deploy].startCommand because that
+# would override every service's per-UI setting (Railway repo-level toml
+# wins over service-UI overrides). Set start command + healthcheck per
+# service in the dashboard.
+#
+# Both services share the build via Nixpacks (auto-detects pnpm via the
+# packageManager field in package.json).
+#
+# Migrations: the API service runs them on first boot via `DB_MIGRATIONS_RUN=1`
+# (idempotent CREATE…IF NOT EXISTS); the worker sets `DB_MIGRATIONS_RUN=0`
+# so only one service owns migrations.
+
+[build]
+builder = "NIXPACKS"
+buildCommand = "pnpm install --frozen-lockfile && pnpm run build"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3

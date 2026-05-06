@@ -1,0 +1,29 @@
+# Files excluded from `railway up` tarball uploads.
+# Mirrors .gitignore for the heavy stuff that shouldn't ship to the build.
+
+node_modules
+dist
+build
+.git
+logs
+coverage
+.nyc_output
+
+# Local dump files from pg_dump (can be hundreds of MB)
+*.dump
+*.sql
+
+# Local env files
+*.env
+.env
+.env.local
+.env.development
+
+# OS / editor cruft
+.DS_Store
+.idea
+.vscode
+
+# Test artifacts
+*.eslintcache
+openapi-spec.json

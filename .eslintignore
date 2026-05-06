@@ -1,0 +1,8 @@
+node_modules
+dist
+docker
+package-lock.json
+coverage
+logs
+openapi-spec.json
+*/**/_current.json
