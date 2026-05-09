@@ -11,7 +11,6 @@ import { FastauthContractStateModule } from "./modules/fastauth-contract-state/f
 import { HealthApiModule } from "./modules/health-api/health-api.module";
 import { HealthModule } from "./modules/health/health.module";
 import { IndexerTriggerModule } from "./modules/indexer-trigger/indexer-trigger.module";
-import { MpcConsensusModule } from "./modules/mpc-consensus/mpc-consensus.module";
 import { NearIngestModule } from "./modules/near-ingest/near-ingest.module";
 import { OpsModule } from "./modules/ops/ops.module";
 import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-key-accounts.module";
@@ -34,7 +33,6 @@ import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-ke
 
         // Domain modules — each declares its own common-module imports.
         FastauthContractStateModule,
-        MpcConsensusModule,
         HealthModule,
         PublicKeyAccountsModule,
         NearIngestModule,

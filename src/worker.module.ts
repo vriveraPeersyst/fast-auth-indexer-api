@@ -7,7 +7,6 @@ import configuration from "./config/configuration";
 import { FastauthContractStateModule } from "./modules/fastauth-contract-state/fastauth-contract-state.module";
 import { HealthModule } from "./modules/health/health.module";
 import { IndexerSchedulerModule } from "./modules/indexer-scheduler/indexer-scheduler.module";
-import { MpcConsensusModule } from "./modules/mpc-consensus/mpc-consensus.module";
 import { NearIngestModule } from "./modules/near-ingest/near-ingest.module";
 import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-key-accounts.module";
 
@@ -35,7 +34,6 @@ import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-ke
         ScheduleModule.forRoot(),
         FastauthContractStateModule,
         HealthModule,
-        MpcConsensusModule,
         NearIngestModule,
         PublicKeyAccountsModule,
         IndexerSchedulerModule,

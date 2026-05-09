@@ -4,7 +4,6 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { In, MoreThanOrEqual, Repository } from "typeorm";
 
 import { Account } from "../../database/entities/Account";
-import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -161,8 +160,6 @@ export class DashboardDataService {
         @InjectRepository(Relayer) private readonly relayerRepo: Repository<Relayer>,
         @InjectRepository(FastAuthSignEvent) private readonly signEventRepo: Repository<FastAuthSignEvent>,
         @InjectRepository(FastAuthHealthTx) private readonly healthRepo: Repository<FastAuthHealthTx>,
-        @InjectRepository(FastAuthConsumerTransaction)
-        private readonly consumerRepo: Repository<FastAuthConsumerTransaction>,
         @InjectRepository(NearTransaction) private readonly nearTxRepo: Repository<NearTransaction>,
         @InjectRepository(FastAuthPublicKeyAccount)
         private readonly pkaRepo: Repository<FastAuthPublicKeyAccount>,
@@ -361,55 +358,29 @@ export class DashboardDataService {
             executionStatus: tx.executionStatus,
         }));
 
-        // Look up consumer tx for each recent sign event so we can show downstream landing.
-        const recentEventIds = recentSignEventsRaw.map((event) => event.id);
-        const consumerByEventId = new Map<string, { failureReason: string | null; txHash: string }>();
-        if (recentEventIds.length > 0) {
-            const consumerRows = await this.consumerRepo.find({
-                where: { linkedSignEventId: In(recentEventIds) },
-                select: { linkedSignEventId: true, failureReason: true, txHash: true },
-            });
-            for (const row of consumerRows) {
-                if (row.linkedSignEventId) {
-                    consumerByEventId.set(row.linkedSignEventId, {
-                        failureReason: row.failureReason,
-                        txHash: row.txHash,
-                    });
-                }
-            }
-        }
-
-        const recentSignEvents: RecentSignEvent[] = recentSignEventsRaw.map((event) => {
-            const consumer = consumerByEventId.get(event.id) ?? null;
-            const consumerStatus: RecentSignEvent["consumerStatus"] = consumer
-                ? consumer.failureReason
-                    ? "failed"
-                    : "succeeded"
-                : "pending";
-            return {
-                id: event.id,
-                txHash: event.txHash,
-                actionIndex: event.actionIndex,
-                blockHeight: event.blockHeight,
-                blockTimestamp: event.blockTimestamp,
-                relayerAccountId: event.relayerAccountId,
-                fastAuthContractId: event.fastAuthContractId,
-                guardName: event.guardName,
-                providerType: event.providerType,
-                algorithm: event.algorithm,
-                userDomainId: event.userDomainId,
-                userDerivedPublicKey: event.userDerivedPublicKey,
-                userAccountId: event.userAccountId,
-                signActionType: event.signActionType,
-                consumerStatus,
-                consumerFailureReason: consumer?.failureReason ?? null,
-                consumerTxHash: consumer?.txHash ?? null,
-                projectDappId: event.projectDappId,
-                sponsoredAccountId: event.sponsoredAccountId,
-                executionStatus: event.executionStatus,
-                gasBurnt: event.gasBurnt,
-            };
-        });
+        const recentSignEvents: RecentSignEvent[] = recentSignEventsRaw.map((event) => ({
+            id: event.id,
+            txHash: event.txHash,
+            actionIndex: event.actionIndex,
+            blockHeight: event.blockHeight,
+            blockTimestamp: event.blockTimestamp,
+            relayerAccountId: event.relayerAccountId,
+            fastAuthContractId: event.fastAuthContractId,
+            guardName: event.guardName,
+            providerType: event.providerType,
+            algorithm: event.algorithm,
+            userDomainId: event.userDomainId,
+            userDerivedPublicKey: event.userDerivedPublicKey,
+            userAccountId: event.userAccountId,
+            signActionType: event.signActionType,
+            consumerStatus: "pending",
+            consumerFailureReason: null,
+            consumerTxHash: null,
+            projectDappId: event.projectDappId,
+            sponsoredAccountId: event.sponsoredAccountId,
+            executionStatus: event.executionStatus,
+            gasBurnt: event.gasBurnt,
+        }));
 
         const chainHeadValue = nearChainHeadCheckpoint?.value ?? nearHeightCheckpoint?.value ?? null;
         const scannedHeightValue = nearScannedCheckpoint?.value ?? null;

@@ -1,11 +1,9 @@
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 
-import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
-import { MpcTransaction } from "../../database/entities/MpcTransaction";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { Relayer } from "../../database/entities/Relayer";
 import { CheckpointsModule } from "../common/checkpoints/checkpoints.module";
@@ -18,15 +16,7 @@ import { RelayerMartsService } from "./relayer-marts.service";
 
 @Module({
     imports: [
-        TypeOrmModule.forFeature([
-            NearTransaction,
-            FastAuthSignEvent,
-            FastAuthConsumerTransaction,
-            FastAuthUserTransaction,
-            MpcTransaction,
-            FastAuthPublicKeyAccount,
-            Relayer,
-        ]),
+        TypeOrmModule.forFeature([NearTransaction, FastAuthSignEvent, FastAuthUserTransaction, FastAuthPublicKeyAccount, Relayer]),
         NearRpcModule,
         CheckpointsModule,
         PricingModule,

@@ -41,13 +41,13 @@ pnpm test:coverage        # must stay above the configured branches/statements g
 
 Each runs one bounded cycle and exits. The **worker** invokes the same underlying `runOnce()` methods on a cron schedule; you only need the CLI form for ad-hoc runs or external triggers.
 
+Reduced to the surface that feeds the FastAuth landing (`/api/public/metrics` + `/api/public/status`). Consumer-tx, MPC-internal, and chain-health-snapshot collectors were removed; their entities are archived in `src/database/_backup/entities/` and their Postgres tables renamed to `_backup_<name>` by the lean migration.
+
 ```bash
-pnpm cli -- near:ingest               # block scan: FA / consumer / user / MPC paths
+pnpm cli -- near:ingest               # block scan: FA-receiver (Path 1) + user-activity (Path 3)
 pnpm cli -- pka:run                   # public-key → account resolver (FastNEAR + MPC view-call)
 pnpm cli -- health:fastauth           # FA-receiver tx classifier (5-outcome guard/MPC split)
-pnpm cli -- health:consumer           # consumer-tx classifier (3-outcome generic)
 pnpm cli -- health:user               # user-activity classifier (3-outcome generic)
-pnpm cli -- mpc:run                   # MPC consensus: respond + sign-direct + sign-fastauth + governance
 pnpm cli -- fac-state:snapshot        # FastAuth contract-state snapshot (5-min throttle)
 ```
 
@@ -59,9 +59,7 @@ pnpm cli -- fac-state:snapshot        # FastAuth contract-state snapshot (5-min 
 | ----------------- | ------------- |
 | `near-ingest`     | every 30s     |
 | `health-fastauth` | every 30s     |
-| `health-consumer` | every 30s     |
 | `health-user`     | every 30s     |
-| `mpc-consensus`   | every 30s     |
 | `pka`             | every 1 min   |
 | `contract-state`  | every 5 min   |
 
@@ -167,8 +165,9 @@ src/
 ├── worker.module.ts       ← Worker root module (no HTTP surface)
 ├── config/
 ├── database/
-│   ├── entities/          ← TypeORM entities (24)
-│   └── migrations/        ← InitialSchema (idempotent) + AddUpdatedAtDefaults
+│   ├── entities/          ← TypeORM entities (11 — only what the landing reads)
+│   ├── _backup/entities/  ← 13 archived entities (excluded from build)
+│   └── migrations/        ← InitialSchema + AddUpdatedAtDefaults + LeanLandingBackupTables
 └── modules/
     ├── common/                       ← cross-cutting infrastructure
     │   ├── concurrency.ts            ← runWithConcurrency + runWithConcurrencyAbortOnError

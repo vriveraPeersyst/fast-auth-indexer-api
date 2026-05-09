@@ -2,7 +2,6 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { getRepositoryToken } from "@nestjs/typeorm";
 
 import { Account } from "../../database/entities/Account";
-import { FastAuthChainHealthSnapshot } from "../../database/entities/FastAuthChainHealthSnapshot";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { Relayer } from "../../database/entities/Relayer";
@@ -13,14 +12,12 @@ describe("DashboardService", () => {
     let signEventRepo: { count: jest.Mock };
     let accountRepo: { count: jest.Mock };
     let relayerRepo: { count: jest.Mock };
-    let chainHealthRepo: { findOne: jest.Mock };
     let contractSnapRepo: { createQueryBuilder: jest.Mock; query: jest.Mock };
 
     beforeEach(async () => {
         signEventRepo = { count: jest.fn() };
         accountRepo = { count: jest.fn() };
         relayerRepo = { count: jest.fn() };
-        chainHealthRepo = { findOne: jest.fn() };
         contractSnapRepo = {
             createQueryBuilder: jest.fn(() => ({
                 select: jest.fn().mockReturnThis(),
@@ -35,7 +32,6 @@ describe("DashboardService", () => {
                 { provide: getRepositoryToken(FastAuthSignEvent), useValue: signEventRepo },
                 { provide: getRepositoryToken(Account), useValue: accountRepo },
                 { provide: getRepositoryToken(Relayer), useValue: relayerRepo },
-                { provide: getRepositoryToken(FastAuthChainHealthSnapshot), useValue: chainHealthRepo },
                 { provide: getRepositoryToken(FastAuthContractSnapshot), useValue: contractSnapRepo },
             ],
         }).compile();
@@ -69,13 +65,6 @@ describe("DashboardService", () => {
 
         const result = await service.getOverview();
         expect(result.latestContractSnapshotsAt).toBe("2026-01-01T00:00:00.000Z");
-    });
-
-    it("getLatestChainHealth returns the most recent snapshot", async () => {
-        const snapshot = { id: 1 } as FastAuthChainHealthSnapshot;
-        chainHealthRepo.findOne.mockResolvedValue(snapshot);
-        const result = await service.getLatestChainHealth();
-        expect(result).toBe(snapshot);
     });
 
     it("getLatestContractSnapshots executes a DISTINCT ON query", async () => {

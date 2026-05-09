@@ -14,5 +14,6 @@
         "incremental": true,
         "skipLibCheck": true
     },
-    "include": ["src/**/*", "test/**/*.spec.ts"]
+    "include": ["src/**/*", "test/**/*.spec.ts"],
+    "exclude": ["src/**/_backup/**", "src/database/_backup/**"]
 }

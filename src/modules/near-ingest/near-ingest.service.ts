@@ -3,11 +3,9 @@ import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 
-import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
-import { MpcTransaction } from "../../database/entities/MpcTransaction";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { CheckpointsService } from "../common/checkpoints/checkpoints.service";
 import { runWithConcurrencyAbortOnError } from "../common/concurrency";
@@ -45,9 +43,7 @@ const CHECKPOINT_CHAIN_HEAD_HASH = "near_chain_head_hash";
 const CHECKPOINT_BACKFILL_START_ORIGIN = "near_backfill_start_origin";
 
 type NearTxRow = Partial<NearTransaction>;
-type ConsumerRow = Partial<FastAuthConsumerTransaction>;
 type UserTxRow = Partial<FastAuthUserTransaction>;
-type MpcTxRow = Partial<MpcTransaction>;
 
 /**
  * Block-walking ingest collector. Per cycle:
@@ -61,29 +57,22 @@ type MpcTxRow = Partial<MpcTransaction>;
  *      - Fetch block + chunks via NEAR RPC pool.
  *      - Pre-extract candidate pubkeys/accounts referenced in this block,
  *        probe DB for which exist (one query each, scoped to candidates).
- *      - For every tx, classify against 4 disjoint paths:
+ *      - For every tx, classify against 2 disjoint paths:
  *          Path 1 — receiver in FA contract set       → near_transactions + sign-event seeds
- *          Path 2 — Delegate signed by FA-derived key → fastauth_consumer_transactions
  *          Path 3 — signer/inner-sender in FA account → fastauth_user_transactions (with USD valuation)
- *          Path 4 — receiver in MPC contract set      → mpc_transactions
  *      - Bulk-insert per block.
  *   5. Advance checkpoints to highest contiguous completed height.
  *   6. Rebuild relayer marts only when sign events were actually persisted.
- *   7. Best-effort link consumer txs back to their producing sign event.
  */
 @Injectable()
 export class NearIngestService {
     private readonly logger = new Logger(NearIngestService.name);
     private readonly fastAuthContractIds: string[];
-    private readonly mpcContractSet: ReadonlySet<string>;
 
     constructor(
         @InjectRepository(NearTransaction) private readonly nearTxRepository: Repository<NearTransaction>,
         @InjectRepository(FastAuthSignEvent) private readonly signEventRepository: Repository<FastAuthSignEvent>,
-        @InjectRepository(FastAuthConsumerTransaction)
-        private readonly consumerRepository: Repository<FastAuthConsumerTransaction>,
         @InjectRepository(FastAuthUserTransaction) private readonly userTxRepository: Repository<FastAuthUserTransaction>,
-        @InjectRepository(MpcTransaction) private readonly mpcTxRepository: Repository<MpcTransaction>,
         @InjectRepository(FastAuthPublicKeyAccount) private readonly pkaRepository: Repository<FastAuthPublicKeyAccount>,
         private readonly checkpoints: CheckpointsService,
         private readonly nearBlock: NearBlockService,
@@ -92,8 +81,6 @@ export class NearIngestService {
         config: ConfigService,
     ) {
         this.fastAuthContractIds = (config.get<string[]>("near.fastauthContractIds") ?? []).map((s) => s.toLowerCase());
-        const mpcIds = (config.get<string[]>("near.mpcContractIds") ?? []).map((s) => s.toLowerCase());
-        this.mpcContractSet = new Set(mpcIds);
     }
 
     async runOnce(): Promise<IndexerRunResult> {
@@ -146,9 +133,7 @@ export class NearIngestService {
                 skippedHeights: 0,
                 indexedTransactions: 0,
                 indexedSignEvents: 0,
-                indexedConsumer: 0,
                 indexedUserTxs: 0,
-                indexedMpcTxs: 0,
                 latestPersistedHeight: -1,
                 latestPersistedHash: null as string | null,
             };
@@ -191,16 +176,12 @@ export class NearIngestService {
 
             const martCounts = stats.indexedSignEvents > 0 ? await this.relayerMarts.rebuild() : { relayers: 0 };
 
-            const linkedConsumerCount = stats.indexedConsumer > 0 ? await this.linkConsumersToSignEvents() : 0;
-
             const detailsBase =
                 `Processed block heights ${startHeight}..${targetHeight}` +
                 (targetHeight < latestHeight ? ` (latest is ${latestHeight})` : "") +
                 `; indexed ${stats.indexedTransactions} transactions, ` +
                 `${stats.indexedSignEvents} sign events, ` +
-                `${stats.indexedConsumer} consumer txs (${linkedConsumerCount} newly linked), ` +
-                `${stats.indexedUserTxs} user-activity txs, ` +
-                `${stats.indexedMpcTxs} mpc txs; ` +
+                `${stats.indexedUserTxs} user-activity txs; ` +
                 `rebuilt marts (${martCounts.relayers} relayers); ` +
                 `skipped ${stats.skippedHeights} empty heights.`;
 
@@ -306,9 +287,7 @@ export class NearIngestService {
             skippedHeights: number;
             indexedTransactions: number;
             indexedSignEvents: number;
-            indexedConsumer: number;
             indexedUserTxs: number;
-            indexedMpcTxs: number;
             latestPersistedHeight: number;
             latestPersistedHash: string | null;
         };
@@ -343,8 +322,6 @@ export class NearIngestService {
         const uniqueTransactions = new Map<string, NearTxRow>();
         const uniqueSignEvents = new Map<string, FastAuthSignEventSeed>();
         const uniqueUserTxs = new Map<string, UserTxRow>();
-        const uniqueConsumerTxs = new Map<string, ConsumerRow>();
-        const uniqueMpcTxs = new Map<string, MpcTxRow>();
 
         const chunkPayloads: NearChunkResponse[] = new Array(chunkHashes.length);
         await runWithConcurrencyAbortOnError(chunkHashes, NEAR_CHUNK_CONCURRENCY, async (chunkHash, idx) => {
@@ -401,8 +378,6 @@ export class NearIngestService {
                     uniqueTransactions,
                     uniqueSignEvents,
                     uniqueUserTxs,
-                    uniqueConsumerTxs,
-                    uniqueMpcTxs,
                 });
             }
         }
@@ -412,17 +387,13 @@ export class NearIngestService {
         const insertResult = await this.persistBlock({
             transactions: [...uniqueTransactions.values()],
             signEvents: [...uniqueSignEvents.values()],
-            consumerTxs: [...uniqueConsumerTxs.values()],
             userTxs: [...uniqueUserTxs.values()],
-            mpcTxs: [...uniqueMpcTxs.values()],
         });
 
         params.stats.processed += 1;
         params.stats.indexedTransactions += insertResult.transactions;
         params.stats.indexedSignEvents += insertResult.signEvents;
-        params.stats.indexedConsumer += insertResult.consumer;
         params.stats.indexedUserTxs += insertResult.userTxs;
-        params.stats.indexedMpcTxs += insertResult.mpcTxs;
 
         if (blockHeight > params.stats.latestPersistedHeight) {
             params.stats.latestPersistedHeight = blockHeight;
@@ -441,7 +412,7 @@ export class NearIngestService {
                 `NEAR collector progress: processed=${params.stats.processed}/${params.totalPlanned} ` +
                     `currentHeight=${params.height} latestPersisted=${params.stats.latestPersistedHeight} ` +
                     `txs=${params.stats.indexedTransactions} signEvents=${params.stats.indexedSignEvents} ` +
-                    `mpc=${params.stats.indexedMpcTxs} skipped=${params.stats.skippedHeights} elapsedMs=${elapsedMs}`,
+                    `userTxs=${params.stats.indexedUserTxs} skipped=${params.stats.skippedHeights} elapsedMs=${elapsedMs}`,
             );
         }
     }
@@ -458,8 +429,6 @@ export class NearIngestService {
         uniqueTransactions: Map<string, NearTxRow>;
         uniqueSignEvents: Map<string, FastAuthSignEventSeed>;
         uniqueUserTxs: Map<string, UserTxRow>;
-        uniqueConsumerTxs: Map<string, ConsumerRow>;
-        uniqueMpcTxs: Map<string, MpcTxRow>;
     }): void {
         const { tx, blockHeight, blockTimestamp } = params;
         const txHash = tx.hash;
@@ -512,28 +481,6 @@ export class NearIngestService {
             for (const pk of inlinePublicKeys) {
                 params.fastAuthPubKeySet.add(pk);
                 params.inlinePubKeyDiscoveries.add(pk);
-            }
-        }
-
-        // Path 2 — Delegate signed by FA-derived key
-        if (params.fastAuthPubKeySet.size > 0) {
-            const delegateInfo = extractDelegateActionInfo(tx.actions);
-            if (delegateInfo && params.fastAuthPubKeySet.has(delegateInfo.innerPublicKey)) {
-                const blockTs = toDateFromNearNs(blockTimestamp);
-                params.uniqueConsumerTxs.set(txHash, {
-                    txHash,
-                    blockHeight: String(blockHeight),
-                    blockTimestamp: blockTs,
-                    outerSignerId: tx.signer_id ?? "(unknown)",
-                    outerSignerPublicKey: relayerPublicKey,
-                    innerSignerId: delegateInfo.innerSignerId,
-                    innerReceiverId: delegateInfo.innerReceiverId,
-                    innerPublicKey: delegateInfo.innerPublicKey,
-                    innerActionTypes: delegateInfo.innerActionTypes,
-                    executionStatus,
-                    failureReason,
-                    linkedSignEventId: null,
-                });
             }
         }
 
@@ -613,51 +560,23 @@ export class NearIngestService {
                 }
             }
         }
-
-        // Path 4 — receiver in MPC contract set (raw landing)
-        if (normalizedReceiverId && this.mpcContractSet.has(normalizedReceiverId)) {
-            const { methodName: mpcMethod, attachedDepositYocto: mpcDeposit } = parseActionMetadata(tx.actions);
-            params.uniqueMpcTxs.set(txHash, {
-                txHash,
-                blockHeight: String(blockHeight),
-                blockTimestamp: toDateFromNearNs(blockTimestamp),
-                signerAccountId: tx.signer_id ?? null,
-                signerPublicKey: relayerPublicKey,
-                receiverId: normalizedReceiverId,
-                methodName: mpcMethod,
-                executionStatus,
-                failureReason,
-                gasBurnt: gasBurnt?.toString() ?? null,
-                attachedDepositYocto: mpcDeposit,
-                payload: toTransactionPayload(tx),
-            });
-        }
     }
 
     private async persistBlock(rows: {
         transactions: NearTxRow[];
         signEvents: FastAuthSignEventSeed[];
-        consumerTxs: ConsumerRow[];
         userTxs: UserTxRow[];
-        mpcTxs: MpcTxRow[];
-    }): Promise<{ transactions: number; signEvents: number; consumer: number; userTxs: number; mpcTxs: number }> {
-        const allEmpty =
-            rows.transactions.length === 0 &&
-            rows.signEvents.length === 0 &&
-            rows.consumerTxs.length === 0 &&
-            rows.userTxs.length === 0 &&
-            rows.mpcTxs.length === 0;
-        if (allEmpty) return { transactions: 0, signEvents: 0, consumer: 0, userTxs: 0, mpcTxs: 0 };
+    }): Promise<{ transactions: number; signEvents: number; userTxs: number }> {
+        const allEmpty = rows.transactions.length === 0 && rows.signEvents.length === 0 && rows.userTxs.length === 0;
+        if (allEmpty) return { transactions: 0, signEvents: 0, userTxs: 0 };
 
-        const [t, s, c, u, m] = await Promise.all([
+        const [t, s, u] = await Promise.all([
             rows.transactions.length > 0 ? this.bulkInsert(this.nearTxRepository, rows.transactions) : Promise.resolve(0),
             rows.signEvents.length > 0 ? this.bulkInsert(this.signEventRepository, rows.signEvents) : Promise.resolve(0),
-            rows.consumerTxs.length > 0 ? this.bulkInsert(this.consumerRepository, rows.consumerTxs) : Promise.resolve(0),
             rows.userTxs.length > 0 ? this.bulkInsert(this.userTxRepository, rows.userTxs) : Promise.resolve(0),
-            rows.mpcTxs.length > 0 ? this.bulkInsert(this.mpcTxRepository, rows.mpcTxs) : Promise.resolve(0),
         ]);
 
-        return { transactions: t, signEvents: s, consumer: c, userTxs: u, mpcTxs: m };
+        return { transactions: t, signEvents: s, userTxs: u };
     }
 
     private async bulkInsert<T>(repo: Repository<T>, rows: any[]): Promise<number> {
@@ -673,29 +592,6 @@ export class NearIngestService {
         await this.checkpoints.set(CHECKPOINT_SCANNED_HEIGHT, String(targetHeight));
         if (stats.latestPersistedHeight === targetHeight && stats.latestPersistedHash) {
             await this.checkpoints.set(CHECKPOINT_HASH, stats.latestPersistedHash);
-        }
-    }
-
-    private async linkConsumersToSignEvents(): Promise<number> {
-        try {
-            const result = await this.consumerRepository.query<{ rowsAffected?: number }>(
-                `UPDATE fastauth_consumer_transactions ct
-                 SET linked_sign_event_id = (
-                     SELECT se.id
-                     FROM fastauth_sign_events se
-                     WHERE se.user_derived_public_key = ct.inner_public_key
-                       AND se.block_timestamp <= ct.block_timestamp
-                       AND se.block_timestamp >= ct.block_timestamp - INTERVAL '60 seconds'
-                     ORDER BY se.block_timestamp DESC
-                     LIMIT 1
-                 )
-                 WHERE ct.linked_sign_event_id IS NULL`,
-            );
-            if (Array.isArray(result)) return 0;
-            return Number((result as any)?.rowsAffected ?? 0);
-        } catch {
-            // Linking is best-effort — re-run later via ops command.
-            return 0;
         }
     }
 }

@@ -3,7 +3,6 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { getRepositoryToken } from "@nestjs/typeorm";
 
 import { Account } from "../../database/entities/Account";
-import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -54,7 +53,6 @@ describe("DashboardDataService", () => {
                 { provide: getRepositoryToken(Relayer), useValue: makeRepo() },
                 { provide: getRepositoryToken(FastAuthSignEvent), useValue: signEventRepo },
                 { provide: getRepositoryToken(FastAuthHealthTx), useValue: healthRepo },
-                { provide: getRepositoryToken(FastAuthConsumerTransaction), useValue: makeRepo() },
                 { provide: getRepositoryToken(NearTransaction), useValue: nearTxRepo },
                 { provide: getRepositoryToken(FastAuthPublicKeyAccount), useValue: makeRepo() },
                 { provide: getRepositoryToken(IndexerCheckpoint), useValue: makeRepo() },

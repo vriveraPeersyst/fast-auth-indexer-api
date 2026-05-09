@@ -7,7 +7,6 @@ import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { IndexerCheckpoint } from "../../database/entities/IndexerCheckpoint";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { Relayer } from "../../database/entities/Relayer";
-import { RelayerDapp } from "../../database/entities/RelayerDapp";
 
 /**
  * Destructive: wipes every indexer-managed table back to empty. Used for fresh-
@@ -22,7 +21,6 @@ export class WipeDbService {
         @InjectRepository(FastAuthPublicKeyAccount) private readonly pkaRepo: Repository<FastAuthPublicKeyAccount>,
         @InjectRepository(FastAuthSignEvent) private readonly signEventRepo: Repository<FastAuthSignEvent>,
         @InjectRepository(NearTransaction) private readonly nearTxRepo: Repository<NearTransaction>,
-        @InjectRepository(RelayerDapp) private readonly relayerDappRepo: Repository<RelayerDapp>,
         @InjectRepository(Relayer) private readonly relayerRepo: Repository<Relayer>,
         @InjectRepository(IndexerCheckpoint) private readonly checkpointRepo: Repository<IndexerCheckpoint>,
         private readonly dataSource: DataSource,
@@ -37,7 +35,6 @@ export class WipeDbService {
                 ["fastAuthPublicKeyAccount", FastAuthPublicKeyAccount],
                 ["fastAuthSignEvent", FastAuthSignEvent],
                 ["nearTransaction", NearTransaction],
-                ["relayerDapp", RelayerDapp],
                 ["relayer", Relayer],
                 ["indexerCheckpoint", IndexerCheckpoint],
             ];

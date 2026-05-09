@@ -2,7 +2,6 @@ import { Injectable, Logger } from "@nestjs/common";
 import { Command, Option, Positional } from "nestjs-command";
 
 import { RelayerMartsService } from "../near-ingest/relayer-marts.service";
-import { NodesMartService } from "../mpc-consensus/nodes-mart.service";
 import { SeedMissingRangesService } from "./seed-missing-ranges.service";
 import { SkipForwardService } from "./skip-forward.service";
 import { WipeDbService } from "./wipe-db.service";
@@ -34,16 +33,15 @@ export class WipeDbCommand {
 export class RebuildMartsCommand {
     private readonly logger = new Logger(RebuildMartsCommand.name);
 
-    constructor(private readonly relayerMarts: RelayerMartsService, private readonly nodesMart: NodesMartService) {}
+    constructor(private readonly relayerMarts: RelayerMartsService) {}
 
     @Command({
         command: "ops:rebuild-marts",
-        describe: "Rebuild relayers + mpc_nodes marts from scratch (delete-then-insert).",
+        describe: "Rebuild relayers mart from scratch (delete-then-insert).",
     })
     async run(): Promise<void> {
         const relayer = await this.relayerMarts.rebuild();
-        const nodes = await this.nodesMart.rebuild();
-        this.logger.log(`ops:rebuild-marts result=${JSON.stringify({ relayers: relayer.relayers, mpcNodes: nodes })}`);
+        this.logger.log(`ops:rebuild-marts result=${JSON.stringify({ relayers: relayer.relayers })}`);
     }
 }
 

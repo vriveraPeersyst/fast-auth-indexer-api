@@ -2,8 +2,6 @@ import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 
 import { Account } from "../../database/entities/Account";
-import { FastAuthChainHealthSnapshot } from "../../database/entities/FastAuthChainHealthSnapshot";
-import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -23,8 +21,6 @@ import { MetricsService } from "./metrics.service";
     imports: [
         TypeOrmModule.forFeature([
             Account,
-            FastAuthChainHealthSnapshot,
-            FastAuthConsumerTransaction,
             FastAuthContractSnapshot,
             FastAuthHealthTx,
             FastAuthPublicKeyAccount,

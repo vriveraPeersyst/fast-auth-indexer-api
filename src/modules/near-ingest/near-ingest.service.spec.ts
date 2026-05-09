@@ -2,11 +2,9 @@ import { ConfigService } from "@nestjs/config";
 import { Test, TestingModule } from "@nestjs/testing";
 import { getRepositoryToken } from "@nestjs/typeorm";
 
-import { FastAuthConsumerTransaction } from "../../database/entities/FastAuthConsumerTransaction";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
-import { MpcTransaction } from "../../database/entities/MpcTransaction";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { CheckpointsService } from "../common/checkpoints/checkpoints.service";
 import { NearRpcExhaustedError } from "../common/near-rpc/near-rpc-exhausted.error";
@@ -36,9 +34,7 @@ describe("NearIngestService", () => {
     let service: NearIngestService;
     let nearTxRepo: any;
     let signEventRepo: any;
-    let consumerRepo: any;
     let userTxRepo: any;
-    let mpcTxRepo: any;
     let pkaRepo: any;
     let checkpoints: { get: jest.Mock; set: jest.Mock };
     let nearBlock: {
@@ -53,7 +49,6 @@ describe("NearIngestService", () => {
     async function build(
         configValues: Record<string, string[]> = {
             "near.fastauthContractIds": ["fast-auth.near"],
-            "near.mpcContractIds": ["v1.signer"],
         },
     ): Promise<void> {
         const repoFactory = (): any => ({
@@ -63,16 +58,11 @@ describe("NearIngestService", () => {
 
         nearTxRepo = repoFactory();
         signEventRepo = { ...repoFactory(), createQueryBuilder: jest.fn() };
-        // signEventRepo will be used both for insert (createQueryBuilder().insert()) AND
-        // for the loadFastAuthPubKeySet read (createQueryBuilder("e").select().where().getRawMany()).
-        // To distinguish, return a mock that serves both shapes.
         signEventRepo.createQueryBuilder = jest.fn((alias?: string) => {
             if (alias === "e") return makeSelectQbMock([]);
             return makeInsertQbMock();
         });
-        consumerRepo = repoFactory();
         userTxRepo = repoFactory();
-        mpcTxRepo = repoFactory();
         pkaRepo = {
             createQueryBuilder: jest.fn(() => makeSelectQbMock([])),
             query: jest.fn().mockResolvedValue([]),
@@ -95,9 +85,7 @@ describe("NearIngestService", () => {
                 NearIngestService,
                 { provide: getRepositoryToken(NearTransaction), useValue: nearTxRepo },
                 { provide: getRepositoryToken(FastAuthSignEvent), useValue: signEventRepo },
-                { provide: getRepositoryToken(FastAuthConsumerTransaction), useValue: consumerRepo },
                 { provide: getRepositoryToken(FastAuthUserTransaction), useValue: userTxRepo },
-                { provide: getRepositoryToken(MpcTransaction), useValue: mpcTxRepo },
                 { provide: getRepositoryToken(FastAuthPublicKeyAccount), useValue: pkaRepo },
                 { provide: CheckpointsService, useValue: checkpoints },
                 { provide: NearBlockService, useValue: nearBlock },
@@ -118,7 +106,7 @@ describe("NearIngestService", () => {
     });
 
     it("returns skipped when fastauthContractIds is empty", async () => {
-        await build({ "near.fastauthContractIds": [], "near.mpcContractIds": [] });
+        await build({ "near.fastauthContractIds": [] });
 
         const result = await service.runOnce();
 
@@ -150,7 +138,7 @@ describe("NearIngestService", () => {
         expect(result.details).toMatch(/already at latest/);
     });
 
-    it("indexes a FA-receiver tx (Path 1) and a v1.signer tx (Path 4)", async () => {
+    it("indexes a FA-receiver tx (Path 1)", async () => {
         const baseHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
             result: {
@@ -180,14 +168,6 @@ describe("NearIngestService", () => {
                         actions: [{ FunctionCall: { method_name: "sign", args, deposit: "0" } }],
                         outcome: { outcome: { gas_burnt: 100, status: { SuccessValue: "" } } },
                     },
-                    {
-                        hash: "mpc-tx",
-                        signer_id: "node.near",
-                        public_key: "ed25519:nk",
-                        receiver_id: "v1.signer",
-                        actions: [{ FunctionCall: { method_name: "respond", args: "" } }],
-                        outcome: { outcome: { gas_burnt: 50, status: { SuccessValue: "" } } },
-                    },
                 ],
             },
         });
@@ -195,15 +175,10 @@ describe("NearIngestService", () => {
         const result = await service.runOnce();
 
         expect(result.status).toBe("ok");
-        // The block was processed. Path 1 should have queued near + sign rows; Path 4 should have queued mpc rows.
         expect(nearTxRepo.createQueryBuilder).toHaveBeenCalled();
-        expect(mpcTxRepo.createQueryBuilder).toHaveBeenCalled();
     });
 
     it("counts skippable missing heights without throwing", async () => {
-        // Set scanned checkpoint two below latest so the range walks 2 heights;
-        // the lower one calls fetchBlockByHeight (which we make reject as
-        // skippable). The upper one == latestHeight uses latestPayload directly.
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
             result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
@@ -258,64 +233,6 @@ describe("NearIngestService", () => {
         expect(relayerMarts.rebuild).not.toHaveBeenCalled();
     });
 
-    it("logs and returns 0 when consumer-tx linker query throws", async () => {
-        const baseHeight = 200_000_000;
-        nearBlock.fetchFinalBlock.mockResolvedValue({
-            result: {
-                header: { height: baseHeight, hash: "h0", timestamp: 1_700_000_000_000_000 },
-                chunks: [{ chunk_hash: "c1" }],
-            },
-        });
-        checkpoints.get.mockImplementation((k: string) => {
-            if (k === "near_last_scanned_height") return String(baseHeight - 1);
-            return null;
-        });
-        nearBlock.fetchBlockByHeight.mockResolvedValue({
-            result: {
-                header: { height: baseHeight, hash: "h0", timestamp: 1_700_000_000_000_000 },
-                chunks: [{ chunk_hash: "c1" }],
-            },
-        });
-        // Pre-populate FA pubkey set so the consumer path triggers.
-        const pubKeyQb = makeSelectQbMock([{ pk: "ed25519:user-key" }]);
-        signEventRepo.createQueryBuilder = jest.fn((alias?: string) => {
-            if (alias === "e") return pubKeyQb;
-            return makeInsertQbMock();
-        });
-        nearBlock.fetchChunkByHash.mockResolvedValue({
-            result: {
-                transactions: [
-                    {
-                        hash: "consumer-tx",
-                        signer_id: "relayer.near",
-                        public_key: "ed25519:rk",
-                        receiver_id: "destination.near",
-                        actions: [
-                            {
-                                Delegate: {
-                                    delegate_action: {
-                                        sender_id: "user.near",
-                                        receiver_id: "destination.near",
-                                        public_key: "ed25519:user-key",
-                                        actions: [{ Transfer: { deposit: "1" } }],
-                                    },
-                                },
-                            },
-                        ],
-                        outcome: { outcome: { gas_burnt: 50, status: { SuccessValue: "" } } },
-                    },
-                ],
-            },
-        });
-        consumerRepo.query.mockRejectedValue(new Error("UPDATE failed"));
-
-        const result = await service.runOnce();
-
-        expect(result.status).toBe("ok");
-        // The linker error is swallowed; "newly linked" reports 0.
-        expect(result.details).toMatch(/0 newly linked/);
-    });
-
     it("indexes a Path 3a user-direct activity tx when signer is a known FA account", async () => {
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
@@ -328,7 +245,6 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 1);
             return null;
         });
-        // Probe returns the signer as a known FA account.
         pkaRepo.query.mockResolvedValue([{ account_id: "alice.near" }]);
         nearBlock.fetchChunkByHash.mockResolvedValue({
             result: {
@@ -394,97 +310,6 @@ describe("NearIngestService", () => {
         expect(userTxRepo.createQueryBuilder).toHaveBeenCalled();
     });
 
-    it("returns linkedConsumerCount when query returns rowsAffected", async () => {
-        const latestHeight = 200_000_000;
-        nearBlock.fetchFinalBlock.mockResolvedValue({
-            result: {
-                header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 },
-                chunks: [{ chunk_hash: "c1" }],
-            },
-        });
-        checkpoints.get.mockImplementation((k: string) => {
-            if (k === "near_last_scanned_height") return String(latestHeight - 1);
-            return null;
-        });
-        // Probe for FA pubkeys returns the inner public key as known.
-        signEventRepo.query.mockResolvedValue([{ pk: "ed25519:user-key" }]);
-        nearBlock.fetchChunkByHash.mockResolvedValue({
-            result: {
-                transactions: [
-                    {
-                        hash: "consumer-tx",
-                        signer_id: "relayer.near",
-                        public_key: "ed25519:rk",
-                        receiver_id: "destination.near",
-                        actions: [
-                            {
-                                Delegate: {
-                                    delegate_action: {
-                                        sender_id: "user.near",
-                                        receiver_id: "destination.near",
-                                        public_key: "ed25519:user-key",
-                                        actions: [{ Transfer: { deposit: "1" } }],
-                                    },
-                                },
-                            },
-                        ],
-                        outcome: { outcome: { gas_burnt: 50, status: { SuccessValue: "" } } },
-                    },
-                ],
-            },
-        });
-        // First query call is the probe (returns pubkeys), second is the linker UPDATE.
-        consumerRepo.query.mockResolvedValue({ rowsAffected: 3 } as any);
-
-        const result = await service.runOnce();
-
-        expect(result.details).toMatch(/3 newly linked/);
-    });
-
-    it("returns 0 when consumer linker result is array shape", async () => {
-        const latestHeight = 200_000_000;
-        nearBlock.fetchFinalBlock.mockResolvedValue({
-            result: {
-                header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 },
-                chunks: [{ chunk_hash: "c1" }],
-            },
-        });
-        checkpoints.get.mockImplementation((k: string) => {
-            if (k === "near_last_scanned_height") return String(latestHeight - 1);
-            return null;
-        });
-        signEventRepo.query.mockResolvedValue([{ pk: "ed25519:user-key" }]);
-        nearBlock.fetchChunkByHash.mockResolvedValue({
-            result: {
-                transactions: [
-                    {
-                        hash: "consumer-tx",
-                        signer_id: "relayer.near",
-                        public_key: "ed25519:rk",
-                        receiver_id: "destination.near",
-                        actions: [
-                            {
-                                Delegate: {
-                                    delegate_action: {
-                                        sender_id: "user.near",
-                                        receiver_id: "destination.near",
-                                        public_key: "ed25519:user-key",
-                                        actions: [{ Transfer: { deposit: "1" } }],
-                                    },
-                                },
-                            },
-                        ],
-                        outcome: { outcome: { gas_burnt: 50, status: { SuccessValue: "" } } },
-                    },
-                ],
-            },
-        });
-        consumerRepo.query.mockResolvedValue([]);
-
-        const result = await service.runOnce();
-        expect(result.details).toMatch(/0 newly linked/);
-    });
-
     it("preserves existing backfill-start-origin checkpoint", async () => {
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
@@ -501,8 +326,6 @@ describe("NearIngestService", () => {
 
         await service.runOnce();
 
-        // The "near_backfill_start_origin" set call should NOT have happened
-        // because the existing value was non-empty.
         const setCalls = checkpoints.set.mock.calls.map((call) => call[0]);
         expect(setCalls).not.toContain("near_backfill_start_origin");
     });
@@ -520,7 +343,6 @@ describe("NearIngestService", () => {
             return null;
         });
         pkaRepo.query.mockResolvedValue([{ account_id: "alice.near" }]);
-        // Pricing returns priced tokens
         pricing.computeActionsValue.mockReturnValue({
             totalUsd: 12.34,
             tokens: [{ symbol: "NEAR", decimals: 24, rawAmount: "100", valueUsd: 12.34 }],
@@ -542,9 +364,6 @@ describe("NearIngestService", () => {
 
         await service.runOnce();
 
-        // The user tx insert was called with token columns populated.
-        // We can't easily inspect the values (mock returns identifiers length), so
-        // assert that pricing was invoked and the insert path fired.
         expect(pricing.computeActionsValue).toHaveBeenCalled();
         expect(userTxRepo.createQueryBuilder).toHaveBeenCalled();
     });
@@ -607,7 +426,6 @@ describe("NearIngestService", () => {
             if (k === "near_last_scanned_height") return String(latestHeight - 2);
             return null;
         });
-        // fetchBlockByHeight returns malformed result
         nearBlock.fetchBlockByHeight.mockResolvedValue({ result: { header: {} } });
 
         const result = await service.runOnce();
