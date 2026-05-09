@@ -30,8 +30,4 @@ export class TtlMemo<T> {
         });
         return promise;
     }
-
-    invalidate(): void {
-        this.entry = null;
-    }
 }

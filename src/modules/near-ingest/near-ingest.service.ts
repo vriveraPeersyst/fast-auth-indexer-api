@@ -284,9 +284,14 @@ export class NearIngestService {
                 );
                 const found = new Set(rows.map((r) => r.pk));
                 for (const c of unknown) probeCache.pubKeyChecked.set(c, found.has(c));
-            } catch {
+            } catch (err) {
                 // On query failure, mark unknowns as not-present so we don't
                 // repeatedly retry the same failing candidates this cycle.
+                // Log the failure: a transient DB hiccup would otherwise
+                // silently misclassify candidates for the rest of the cycle
+                // (~500 blocks) without leaving any trace.
+                const message = err instanceof Error ? err.message : String(err);
+                this.logger.warn(`probePubKeys query failed: candidates=${unknown.length} error=${message}`);
                 for (const c of unknown) probeCache.pubKeyChecked.set(c, false);
             }
         }
@@ -319,7 +324,12 @@ export class NearIngestService {
                 );
                 const found = new Set(rows.map((r) => r.account_id.trim().toLowerCase()));
                 for (const c of unknown) probeCache.accountChecked.set(c, found.has(c));
-            } catch {
+            } catch (err) {
+                // Symmetric to probePubKeys: log the swallow so a transient DB
+                // failure doesn't silently mark every candidate as not-present
+                // for the rest of the cycle.
+                const message = err instanceof Error ? err.message : String(err);
+                this.logger.warn(`probeAccounts query failed: candidates=${unknown.length} error=${message}`);
                 for (const c of unknown) probeCache.accountChecked.set(c, false);
             }
         }
