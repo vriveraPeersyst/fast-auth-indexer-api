@@ -70,6 +70,8 @@ async function bootstrap() {
     // container over the external network interface; default localhost
     // binding is unreachable.
     await app.listen(serverPort, "0.0.0.0");
-    logger.log(`Application is running on: ${await app.getUrl()}`);
+    // Log the actual bind host literally; `app.getUrl()` reports `[::1]` even
+    // when bound to 0.0.0.0 (nestjs/nest#1471) and misleads operators.
+    logger.log(`Application is running on: http://0.0.0.0:${serverPort}`);
 }
 bootstrap();
