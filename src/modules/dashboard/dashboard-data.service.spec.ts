@@ -238,6 +238,29 @@ describe("DashboardDataService", () => {
         expect(result.recentFailuresWindow).toMatch(/Last 24h · \d+ failures/);
     });
 
+    it("degrades a failing section to its default instead of throwing", async () => {
+        // Simulate the production failure mode (Postgres `pgsql_tmp` exhausted
+        // by the CTE-based queries inside `loadRealActivity`): a single repo
+        // call rejects. The endpoint must still return a `DashboardData`
+        // payload with the affected section emptied and the rest intact.
+        const errorSpy = jest.spyOn((service as any).logger, "error").mockImplementation(() => undefined);
+        signEventRepo.count.mockRejectedValue(new Error("pgsql_tmp full"));
+
+        const result = await service.getDashboardData();
+
+        expect(result.transactionOverview.total.last24h).toBe(0);
+        expect(result.transactionOverview.total.last7d).toBe(0);
+        expect(result.transactionOverview.total.last30d).toBe(0);
+        expect(result.tableCounts.fastAuthSignEvents).toBe(0);
+        expect(result.collectorHealth).toHaveLength(2);
+        expect(errorSpy).toHaveBeenCalled();
+        const sectionsLogged = errorSpy.mock.calls
+            .map((call) => (call[0] as { section?: string }).section)
+            .filter((s): s is string => typeof s === "string");
+        expect(sectionsLogged).toEqual(expect.arrayContaining(["signTotal24h"]));
+        errorSpy.mockRestore();
+    });
+
     it("computes blocksProcessed from completedUpTo + completedDownTo cursors", async () => {
         missingRangeRepo.find.mockResolvedValue([
             {

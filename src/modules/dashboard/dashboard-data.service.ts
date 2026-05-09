@@ -119,6 +119,62 @@ function build24hBuckets(
     return buckets;
 }
 
+function emptySignOutcomeCounts(): {
+    failed24h: number;
+    failed7d: number;
+    failed30d: number;
+    failedAll: number;
+    pending24h: number;
+    pending7d: number;
+    pending30d: number;
+    pendingAll: number;
+} {
+    return {
+        failed24h: 0,
+        failed7d: 0,
+        failed30d: 0,
+        failedAll: 0,
+        pending24h: 0,
+        pending7d: 0,
+        pending30d: 0,
+        pendingAll: 0,
+    };
+}
+
+function emptyChainHealthData(): {
+    fastAuthChainHealth: FastAuthChainHealth | null;
+    mpcChainHealth: MpcChainHealth | null;
+    chainHealthHistory: ChainHealthHistoryPoint[];
+} {
+    return { fastAuthChainHealth: null, mpcChainHealth: null, chainHealthHistory: [] };
+}
+
+function emptyFastAuthContracts(): FastAuthContractsOverview {
+    return { contracts: [], earliestSnapshotAt: null };
+}
+
+function emptyRealActivityWindow(): RealActivityWindow {
+    return { total: 0, succeeded: 0, failed: 0, successRatePct: null, distinctUsers: 0, volumeUsd: 0 };
+}
+
+function emptyRealActivity(): RealActivity {
+    return {
+        byWindow: {
+            last24h: emptyRealActivityWindow(),
+            last7d: emptyRealActivityWindow(),
+            last30d: emptyRealActivityWindow(),
+            all: emptyRealActivityWindow(),
+        },
+        byReceiver: [],
+        byMethod: [],
+        byRelayer: { overall: [], byReceiver: [], byMethod: [] },
+        byProvider: { overall: [], byReceiver: [], byMethod: [] },
+        byGuard: { overall: [], byReceiver: [], byMethod: [] },
+        topFailureReasons: [],
+        trackingStartedAt: null,
+    };
+}
+
 function getCollectorHealthStatus(
     lastWriteAt: Date | null,
     pollIntervalMs: number,
@@ -194,48 +250,13 @@ export class DashboardDataService {
         const last30d = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
         const pollIntervalMs = this.resolvePollIntervalMs();
 
-        const [
-            accountsTotal,
-            accountsFirstSeen24h,
-            accountsFirstSeen7d,
-            accountsFirstSeen30d,
-            accountsActive24h,
-            accountsActive7d,
-            accountsActive30d,
-            signTotal24h,
-            signTotal7d,
-            signTotal30d,
-            signOutcomeCounts,
-            nearHeightCheckpoint,
-            nearScannedCheckpoint,
-            nearChainHeadCheckpoint,
-            nearBackfillOriginCheckpoint,
-            chainHealthData,
-            lastNearTransaction,
-            relayerRows,
-            relayerSponsoredPairsAllTime,
-            relayerSponsoredPairs24h,
-            relayerSponsoredPairs7d,
-            relayerSponsoredPairs30d,
-            recentNearTransactionsRaw,
-            recentSignEventsRaw,
-            topPublicKeyAccountsRaw,
-            indexerCheckpointsRaw,
-            nearTransactionsTotalCount,
-            fastAuthSignEventsTotalCount,
-            accountsTotalCount,
-            publicKeyAccountsTotalCount,
-            relayersTotalCount,
-            indexerCheckpointsTotalCount,
-            topAccounts,
-            missingBlockRanges,
-            fastAuthContracts,
-            guardBreakdown,
-            providerBreakdown,
-            relayerBreakdownByActivity,
-            actionTypeBreakdown,
-            realActivity,
-        ] = await Promise.all([
+        // Resilience: any individual section failing (e.g. Postgres `pgsql_tmp`
+        // exhausted by the heavier CTE-based queries in `loadRealActivity`)
+        // must not surface as a 500 on `/public/status` or `/public/dashboard-data`.
+        // We collect every section via `Promise.allSettled` and degrade
+        // rejected slots to typed defaults that preserve the `DashboardData`
+        // contract the FastAuth landing page consumes.
+        const settled = await Promise.allSettled([
             this.accountRepo.count(),
             this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last24h) } }),
             this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last7d) } }),
@@ -276,7 +297,48 @@ export class DashboardDataService {
             this.loadRelayerBreakdownByActivity(last24h, last7d, last30d),
             this.loadActionTypeBreakdown(last24h, last7d, last30d),
             this.loadRealActivity(last24h, last7d, last30d),
-        ]);
+        ] as const);
+
+        const accountsTotal = this.unwrapSection(settled[0], "accountsTotal", 0);
+        const accountsFirstSeen24h = this.unwrapSection(settled[1], "accountsFirstSeen24h", 0);
+        const accountsFirstSeen7d = this.unwrapSection(settled[2], "accountsFirstSeen7d", 0);
+        const accountsFirstSeen30d = this.unwrapSection(settled[3], "accountsFirstSeen30d", 0);
+        const accountsActive24h = this.unwrapSection(settled[4], "accountsActive24h", 0);
+        const accountsActive7d = this.unwrapSection(settled[5], "accountsActive7d", 0);
+        const accountsActive30d = this.unwrapSection(settled[6], "accountsActive30d", 0);
+        const signTotal24h = this.unwrapSection(settled[7], "signTotal24h", 0);
+        const signTotal7d = this.unwrapSection(settled[8], "signTotal7d", 0);
+        const signTotal30d = this.unwrapSection(settled[9], "signTotal30d", 0);
+        const signOutcomeCounts = this.unwrapSection(settled[10], "signOutcomeCounts", emptySignOutcomeCounts());
+        const nearHeightCheckpoint = this.unwrapSection(settled[11], "nearHeightCheckpoint", null);
+        const nearScannedCheckpoint = this.unwrapSection(settled[12], "nearScannedCheckpoint", null);
+        const nearChainHeadCheckpoint = this.unwrapSection(settled[13], "nearChainHeadCheckpoint", null);
+        const nearBackfillOriginCheckpoint = this.unwrapSection(settled[14], "nearBackfillOriginCheckpoint", null);
+        const chainHealthData = this.unwrapSection(settled[15], "chainHealth", emptyChainHealthData());
+        const lastNearTransaction = this.unwrapSection(settled[16], "lastNearTransaction", null);
+        const relayerRows = this.unwrapSection(settled[17], "relayerRows", []);
+        const relayerSponsoredPairsAllTime = this.unwrapSection(settled[18], "relayerSponsoredPairsAllTime", []);
+        const relayerSponsoredPairs24h = this.unwrapSection(settled[19], "relayerSponsoredPairs24h", []);
+        const relayerSponsoredPairs7d = this.unwrapSection(settled[20], "relayerSponsoredPairs7d", []);
+        const relayerSponsoredPairs30d = this.unwrapSection(settled[21], "relayerSponsoredPairs30d", []);
+        const recentNearTransactionsRaw = this.unwrapSection(settled[22], "recentNearTransactionsRaw", []);
+        const recentSignEventsRaw = this.unwrapSection(settled[23], "recentSignEventsRaw", []);
+        const topPublicKeyAccountsRaw = this.unwrapSection(settled[24], "topPublicKeyAccountsRaw", []);
+        const indexerCheckpointsRaw = this.unwrapSection(settled[25], "indexerCheckpointsRaw", []);
+        const nearTransactionsTotalCount = this.unwrapSection(settled[26], "nearTransactionsTotalCount", 0);
+        const fastAuthSignEventsTotalCount = this.unwrapSection(settled[27], "fastAuthSignEventsTotalCount", 0);
+        const accountsTotalCount = this.unwrapSection(settled[28], "accountsTotalCount", 0);
+        const publicKeyAccountsTotalCount = this.unwrapSection(settled[29], "publicKeyAccountsTotalCount", 0);
+        const relayersTotalCount = this.unwrapSection(settled[30], "relayersTotalCount", 0);
+        const indexerCheckpointsTotalCount = this.unwrapSection(settled[31], "indexerCheckpointsTotalCount", 0);
+        const topAccounts = this.unwrapSection(settled[32], "topAccounts", []);
+        const missingBlockRanges = this.unwrapSection(settled[33], "missingBlockRanges", []);
+        const fastAuthContracts = this.unwrapSection(settled[34], "fastAuthContracts", emptyFastAuthContracts());
+        const guardBreakdown = this.unwrapSection(settled[35], "guardBreakdown", []);
+        const providerBreakdown = this.unwrapSection(settled[36], "providerBreakdown", []);
+        const relayerBreakdownByActivity = this.unwrapSection(settled[37], "relayerBreakdownByActivity", []);
+        const actionTypeBreakdown = this.unwrapSection(settled[38], "actionTypeBreakdown", []);
+        const realActivity = this.unwrapSection(settled[39], "realActivity", emptyRealActivity());
 
         const totalAccountsAllTime = accountsTotal + MIGRATED_ACCOUNTS_TOTAL;
         const accountsOverview: AggregateAccountsMetrics = {
@@ -650,6 +712,19 @@ export class DashboardDataService {
                 recordedAt: r.recordedAt,
             })),
         };
+    }
+
+    /**
+     * Resolves a `PromiseSettledResult<T>` to a value, falling back to the
+     * supplied default and emitting a structured error log when the slot
+     * rejected. Centralises the degradation policy for the dashboard
+     * fan-out so that infra failures (DB out of disk, lock contention) keep
+     * `/public/status` returning a partial 200 instead of a hard 500.
+     */
+    private unwrapSection<T>(result: PromiseSettledResult<T>, section: string, defaultValue: T): T {
+        if (result.status === "fulfilled") return result.value;
+        this.logger.error({ err: result.reason, section }, "dashboard fan-out: section failed, returning default");
+        return defaultValue;
     }
 
     private resolvePollIntervalMs(): number {
@@ -1436,22 +1511,14 @@ export class DashboardDataService {
             total_24h: string;
         };
 
-        const [
-            windowsRows,
-            receiverRows,
-            methodRows,
-            relayerClassRows,
-            providerClassRows,
-            guardClassRows,
-            relayerReceiverRows,
-            relayerMethodRows,
-            providerReceiverRows,
-            providerMethodRows,
-            guardReceiverRows,
-            guardMethodRows,
-            firstUserTx,
-            reasonRows,
-        ] = await Promise.all([
+        // The 9 CTE-based queries below all inline the same `account_class`
+        // CTE (DISTINCT ON over `fastauth_sign_events`). Running them
+        // concurrently caused `pgsql_tmp` to spill the same sort 9× and
+        // exhaust the disk on the production Postgres. We split them into
+        // two sequential batches so peak temporary-file pressure is bounded
+        // by the larger batch (6) rather than 9, and so a single rejected
+        // query degrades only its own slot.
+        const nonCteSettled = await Promise.allSettled([
             this.userTxRepo.query<WindowsRow[]>(
                 `SELECT
                     COUNT(*) AS total_all,
@@ -1502,15 +1569,6 @@ export class DashboardDataService {
                  LIMIT 20`,
                 [last30d, last7d, last24h],
             ),
-            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("relayer_account_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("provider_type"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("guard_name"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "receiver_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "method_name"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "receiver_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "method_name"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "receiver_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "method_name"), [last30d, last7d, last24h]),
             this.userTxRepo.findOne({
                 where: {},
                 order: { blockTimestamp: "ASC" },
@@ -1530,7 +1588,41 @@ export class DashboardDataService {
                  LIMIT 50`,
                 [last30d, last7d, last24h],
             ),
-        ]);
+        ] as const);
+
+        const windowsRows = this.unwrapSection(nonCteSettled[0], "realActivity.windowsRows", [] as WindowsRow[]);
+        const receiverRows = this.unwrapSection(nonCteSettled[1], "realActivity.receiverRows", [] as ReceiverOrMethodRow[]);
+        const methodRows = this.unwrapSection(nonCteSettled[2], "realActivity.methodRows", [] as ReceiverOrMethodRow[]);
+        const firstUserTx = this.unwrapSection<FastAuthUserTransaction | null>(nonCteSettled[3], "realActivity.firstUserTx", null);
+        const reasonRows = this.unwrapSection(nonCteSettled[4], "realActivity.reasonRows", [] as ReasonRow[]);
+
+        // Batch 1 of 2 (CTE): three `buildClassGroupSql` projections.
+        const classGroupSettled = await Promise.allSettled([
+            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("relayer_account_id"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("provider_type"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("guard_name"), [last30d, last7d, last24h]),
+        ] as const);
+
+        const relayerClassRows = this.unwrapSection(classGroupSettled[0], "realActivity.relayerClassRows", [] as ClassGroupRow[]);
+        const providerClassRows = this.unwrapSection(classGroupSettled[1], "realActivity.providerClassRows", [] as ClassGroupRow[]);
+        const guardClassRows = this.unwrapSection(classGroupSettled[2], "realActivity.guardClassRows", [] as ClassGroupRow[]);
+
+        // Batch 2 of 2 (CTE): six `buildCrossSql` cross-classifications.
+        const crossSettled = await Promise.allSettled([
+            this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "receiver_id"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "method_name"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "receiver_id"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "method_name"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "receiver_id"), [last30d, last7d, last24h]),
+            this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "method_name"), [last30d, last7d, last24h]),
+        ] as const);
+
+        const relayerReceiverRows = this.unwrapSection(crossSettled[0], "realActivity.relayerReceiverRows", [] as CrossRow[]);
+        const relayerMethodRows = this.unwrapSection(crossSettled[1], "realActivity.relayerMethodRows", [] as CrossRow[]);
+        const providerReceiverRows = this.unwrapSection(crossSettled[2], "realActivity.providerReceiverRows", [] as CrossRow[]);
+        const providerMethodRows = this.unwrapSection(crossSettled[3], "realActivity.providerMethodRows", [] as CrossRow[]);
+        const guardReceiverRows = this.unwrapSection(crossSettled[4], "realActivity.guardReceiverRows", [] as CrossRow[]);
+        const guardMethodRows = this.unwrapSection(crossSettled[5], "realActivity.guardMethodRows", [] as CrossRow[]);
 
         const wRow = windowsRows[0];
 
