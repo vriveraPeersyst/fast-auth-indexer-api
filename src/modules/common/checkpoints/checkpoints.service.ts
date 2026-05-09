@@ -45,6 +45,15 @@ export class CheckpointsService {
         await this.repository.upsert({ key, value, updatedAt: new Date() }, ["key"]);
     }
 
+    async setMany(entries: Array<{ key: string; value: string }>): Promise<void> {
+        if (entries.length === 0) return;
+        const now = new Date();
+        await this.repository.upsert(
+            entries.map((e) => ({ key: e.key, value: e.value, updatedAt: now })),
+            ["key"],
+        );
+    }
+
     async setNumber(key: string, value: number): Promise<void> {
         await this.set(key, String(value));
     }

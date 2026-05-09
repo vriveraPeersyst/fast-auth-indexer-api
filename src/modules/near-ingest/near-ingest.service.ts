@@ -45,6 +45,18 @@ const CHECKPOINT_BACKFILL_START_ORIGIN = "near_backfill_start_origin";
 type NearTxRow = Partial<NearTransaction>;
 type UserTxRow = Partial<FastAuthUserTransaction>;
 
+// Per-cycle membership cache. Each entry records whether a pubkey/account was
+// found in the DB. Probes only query the candidates not yet present in the
+// cache, then stamp every result back so subsequent blocks of the same cycle
+// answer from RAM. With NEAR_BLOCK_CONCURRENCY=20 and 500 blocks/cycle, common
+// signers (relayers, MPC accounts) repeat across most blocks — this cache
+// turns ~1000 probe roundtrips into roughly the count of distinct candidates
+// in the window (typically <100).
+type ProbeCache = {
+    pubKeyChecked: Map<string, boolean>;
+    accountChecked: Map<string, boolean>;
+};
+
 /**
  * Block-walking ingest collector. Per cycle:
  *   1. Fetch latest final block, persist chain-head checkpoint.
@@ -68,6 +80,10 @@ type UserTxRow = Partial<FastAuthUserTransaction>;
 export class NearIngestService {
     private readonly logger = new Logger(NearIngestService.name);
     private readonly fastAuthContractIds: string[];
+    // Once the backfill-origin checkpoint is observed (existing or just
+    // written), we never need to re-read it — its value is invariant after
+    // the first cycle. Saves one SELECT per cycle.
+    private backfillOriginObserved = false;
 
     constructor(
         @InjectRepository(NearTransaction) private readonly nearTxRepository: Repository<NearTransaction>,
@@ -97,21 +113,24 @@ export class NearIngestService {
                 throw new Error("NEAR response did not include final block height/hash.");
             }
 
-            await this.checkpoints.set(CHECKPOINT_CHAIN_HEAD_HEIGHT, String(latestHeight));
-            await this.checkpoints.set(CHECKPOINT_CHAIN_HEAD_HASH, latestHash);
-
             const { startHeight, targetHeight } = await this.computeRange(latestHeight);
 
-            // Persist the origin of the backfill on the very first run. We
-            // intentionally never overwrite it — `set` is fine because the
-            // CheckpointsService.upsert path keeps the existing value if we
-            // call it with the same key on subsequent runs (we'd need a
-            // create-only variant to replicate Prisma's behavior exactly,
-            // but operationally this is invariant after first set).
-            const existingOrigin = await this.checkpoints.get(CHECKPOINT_BACKFILL_START_ORIGIN);
-            if (!existingOrigin) {
-                await this.checkpoints.set(CHECKPOINT_BACKFILL_START_ORIGIN, String(startHeight));
+            // Persist chain-head + (first-run only) backfill origin in a
+            // single bulk upsert instead of 2-3 sequential roundtrips. The
+            // origin is invariant after first observation, so we only probe
+            // until we've seen it at least once per process.
+            const headWrites: Array<{ key: string; value: string }> = [
+                { key: CHECKPOINT_CHAIN_HEAD_HEIGHT, value: String(latestHeight) },
+                { key: CHECKPOINT_CHAIN_HEAD_HASH, value: latestHash },
+            ];
+            if (!this.backfillOriginObserved) {
+                const existingOrigin = await this.checkpoints.get(CHECKPOINT_BACKFILL_START_ORIGIN);
+                if (!existingOrigin) {
+                    headWrites.push({ key: CHECKPOINT_BACKFILL_START_ORIGIN, value: String(startHeight) });
+                }
+                this.backfillOriginObserved = true;
             }
+            await this.checkpoints.setMany(headWrites);
 
             this.logger.log(
                 `NEAR collector range selected: startHeight=${startHeight} targetHeight=${targetHeight} latestHeight=${latestHeight}`,
@@ -127,6 +146,14 @@ export class NearIngestService {
             // GC'd after runOnce() returns. Replaces the old all-time
             // fastAuthPubKeySet which scaled with all-time history.
             const batchInlinePubKeys = new Set<string>();
+
+            // Cycle-level membership cache for pubkey/account probes. Entries
+            // accumulate across all blocks of this run and are GC'd when
+            // runOnce() returns. See ProbeCache typedef above for the why.
+            const probeCache: ProbeCache = {
+                pubKeyChecked: new Map(),
+                accountChecked: new Map(),
+            };
 
             const stats = {
                 processed: 0,
@@ -151,6 +178,7 @@ export class NearIngestService {
                         latestPayload,
                         fastAuthContractSet,
                         batchInlinePubKeys,
+                        probeCache,
                         tokenRegistry,
                         stats,
                         completedHeights,
@@ -231,48 +259,75 @@ export class NearIngestService {
     }
 
     /**
-     * Per-block bounded membership probe for FastAuth-derived pubkeys.
+     * Per-cycle bounded membership probe for FastAuth-derived pubkeys.
      * Replaces the old all-time `loadFastAuthPubKeySet()` which loaded every
-     * distinct pubkey from `fastauth_sign_events` into memory each cycle —
-     * the dominant heap-pressure source that OOM'd the legacy worker.
+     * distinct pubkey from `fastauth_sign_events` into memory each cycle.
      *
-     * `candidates` is the small set of inner-pubkeys actually referenced by
-     * the current block's txs (typically tens, not hundreds of thousands).
-     * The query returns only the subset that matches a known sign event.
+     * `candidates` is the set of inner-pubkeys referenced by the current
+     * block. Filters against `probeCache` so that already-seen candidates
+     * across this cycle answer from RAM; only previously-unseen ones reach
+     * the DB. Returns the intersection of (candidates) ∩ (DB-known pubkeys).
      */
-    private async probePubKeys(candidates: string[]): Promise<Set<string>> {
+    private async probePubKeys(candidates: string[], probeCache: ProbeCache): Promise<Set<string>> {
         if (candidates.length === 0) return new Set();
-        try {
-            const rows = await this.signEventRepository.query<Array<{ pk: string }>>(
-                `SELECT DISTINCT user_derived_public_key AS pk
-                 FROM fastauth_sign_events
-                 WHERE user_derived_public_key = ANY($1)`,
-                [candidates],
-            );
-            return new Set(rows.map((r) => r.pk));
-        } catch {
-            return new Set();
+        const unknown: string[] = [];
+        for (const c of candidates) {
+            if (!probeCache.pubKeyChecked.has(c)) unknown.push(c);
         }
+        if (unknown.length > 0) {
+            try {
+                const rows = await this.signEventRepository.query<Array<{ pk: string }>>(
+                    `SELECT DISTINCT user_derived_public_key AS pk
+                     FROM fastauth_sign_events
+                     WHERE user_derived_public_key = ANY($1)`,
+                    [unknown],
+                );
+                const found = new Set(rows.map((r) => r.pk));
+                for (const c of unknown) probeCache.pubKeyChecked.set(c, found.has(c));
+            } catch {
+                // On query failure, mark unknowns as not-present so we don't
+                // repeatedly retry the same failing candidates this cycle.
+                for (const c of unknown) probeCache.pubKeyChecked.set(c, false);
+            }
+        }
+        const result = new Set<string>();
+        for (const c of candidates) {
+            if (probeCache.pubKeyChecked.get(c) === true) result.add(c);
+        }
+        return result;
     }
 
     /**
-     * Per-block bounded membership probe for FastAuth account ids. Replaces
-     * the old all-time `loadFastAuthAccountSet()`. `candidates` is the union
-     * of (block tx signers, delegate inner senders) — typically tens.
+     * Per-cycle bounded membership probe for FastAuth account ids. Same
+     * cache-then-query pattern as probePubKeys; common signers (relayers,
+     * MPC accounts) repeat across most blocks of a window so the cache
+     * dominates after the first few blocks.
      */
-    private async probeAccounts(candidates: string[]): Promise<Set<string>> {
+    private async probeAccounts(candidates: string[], probeCache: ProbeCache): Promise<Set<string>> {
         if (candidates.length === 0) return new Set();
-        try {
-            const rows = await this.pkaRepository.query<Array<{ account_id: string }>>(
-                `SELECT DISTINCT account_id
-                 FROM fastauth_public_key_accounts
-                 WHERE account_id = ANY($1)`,
-                [candidates],
-            );
-            return new Set(rows.map((r) => r.account_id.trim().toLowerCase()));
-        } catch {
-            return new Set();
+        const unknown: string[] = [];
+        for (const c of candidates) {
+            if (!probeCache.accountChecked.has(c)) unknown.push(c);
         }
+        if (unknown.length > 0) {
+            try {
+                const rows = await this.pkaRepository.query<Array<{ account_id: string }>>(
+                    `SELECT DISTINCT account_id
+                     FROM fastauth_public_key_accounts
+                     WHERE account_id = ANY($1)`,
+                    [unknown],
+                );
+                const found = new Set(rows.map((r) => r.account_id.trim().toLowerCase()));
+                for (const c of unknown) probeCache.accountChecked.set(c, found.has(c));
+            } catch {
+                for (const c of unknown) probeCache.accountChecked.set(c, false);
+            }
+        }
+        const result = new Set<string>();
+        for (const c of candidates) {
+            if (probeCache.accountChecked.get(c) === true) result.add(c);
+        }
+        return result;
     }
 
     private async processBlockHeight(params: {
@@ -281,6 +336,7 @@ export class NearIngestService {
         latestPayload: NearBlockResponse;
         fastAuthContractSet: Set<string>;
         batchInlinePubKeys: Set<string>;
+        probeCache: ProbeCache;
         tokenRegistry: TokenRegistry | null;
         stats: {
             processed: number;
@@ -346,8 +402,8 @@ export class NearIngestService {
         }
 
         const [dbKnownPubKeys, dbKnownAccounts] = await Promise.all([
-            this.probePubKeys([...candidatePubKeys]),
-            this.probeAccounts([...candidateAccounts]),
+            this.probePubKeys([...candidatePubKeys], params.probeCache),
+            this.probeAccounts([...candidateAccounts], params.probeCache),
         ]);
 
         // Effective sets for THIS block: DB-known ∪ batch-level inline
@@ -588,10 +644,13 @@ export class NearIngestService {
         targetHeight: number,
         stats: { latestPersistedHeight: number; latestPersistedHash: string | null },
     ): Promise<void> {
-        await this.checkpoints.set(CHECKPOINT_HEIGHT, String(targetHeight));
-        await this.checkpoints.set(CHECKPOINT_SCANNED_HEIGHT, String(targetHeight));
+        const writes: Array<{ key: string; value: string }> = [
+            { key: CHECKPOINT_HEIGHT, value: String(targetHeight) },
+            { key: CHECKPOINT_SCANNED_HEIGHT, value: String(targetHeight) },
+        ];
         if (stats.latestPersistedHeight === targetHeight && stats.latestPersistedHash) {
-            await this.checkpoints.set(CHECKPOINT_HASH, stats.latestPersistedHash);
+            writes.push({ key: CHECKPOINT_HASH, value: stats.latestPersistedHash });
         }
+        await this.checkpoints.setMany(writes);
     }
 }

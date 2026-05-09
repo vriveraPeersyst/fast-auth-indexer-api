@@ -10,16 +10,18 @@ import { MetricsService } from "./metrics.service";
 
 describe("MetricsService", () => {
     let service: MetricsService;
-    let accountRepo: { count: jest.Mock };
-    let signEventRepo: { count: jest.Mock };
+    let accountRepo: { query: jest.Mock };
+    let signEventRepo: { query: jest.Mock };
     let relayerRepo: { count: jest.Mock };
-    let healthRepo: { count: jest.Mock };
+    let healthRepo: { query: jest.Mock };
 
     beforeEach(async () => {
-        accountRepo = { count: jest.fn() };
-        signEventRepo = { count: jest.fn() };
-        relayerRepo = { count: jest.fn() };
-        healthRepo = { count: jest.fn() };
+        accountRepo = {
+            query: jest.fn().mockResolvedValue([{ total: "0", new_24h: "0", active_24h: "0", active_7d: "0", active_30d: "0" }]),
+        };
+        signEventRepo = { query: jest.fn().mockResolvedValue([{ last_7d: "0", last_30d: "0" }]) };
+        relayerRepo = { count: jest.fn().mockResolvedValue(0) };
+        healthRepo = { query: jest.fn().mockResolvedValue([{ ok_24h: "0", failed_24h: "0" }]) };
 
         const moduleRef: TestingModule = await Test.createTestingModule({
             providers: [
@@ -35,16 +37,10 @@ describe("MetricsService", () => {
     });
 
     it("returns the full metrics shape with derived totals and uptime %", async () => {
-        // 5 account counts in order: total, new24h, active24h, active7d, active30d
-        accountRepo.count
-            .mockResolvedValueOnce(1000) // total
-            .mockResolvedValueOnce(15) // new24h
-            .mockResolvedValueOnce(120) // active24h
-            .mockResolvedValueOnce(450) // active7d
-            .mockResolvedValueOnce(800); // active30d
-        signEventRepo.count.mockResolvedValueOnce(7000).mockResolvedValueOnce(28000);
+        accountRepo.query.mockResolvedValue([{ total: "1000", new_24h: "15", active_24h: "120", active_7d: "450", active_30d: "800" }]);
+        signEventRepo.query.mockResolvedValue([{ last_7d: "7000", last_30d: "28000" }]);
         relayerRepo.count.mockResolvedValue(5);
-        healthRepo.count.mockResolvedValueOnce(95).mockResolvedValueOnce(5);
+        healthRepo.query.mockResolvedValue([{ ok_24h: "95", failed_24h: "5" }]);
 
         const result = await service.getMetrics();
 
@@ -69,14 +65,23 @@ describe("MetricsService", () => {
     });
 
     it("returns uptimePct=null when nothing has been classified", async () => {
-        accountRepo.count.mockResolvedValue(0);
-        signEventRepo.count.mockResolvedValue(0);
-        relayerRepo.count.mockResolvedValue(0);
-        healthRepo.count.mockResolvedValue(0);
-
         const result = await service.getMetrics();
 
         expect(result.health24h.uptimePct).toBeNull();
         expect(result.health24h.classified).toBe(0);
+    });
+
+    it("memoizes within the TTL window — repeat calls do not re-query", async () => {
+        await service.getMetrics();
+        await service.getMetrics();
+        await service.getMetrics();
+
+        // Each underlying source should have been hit exactly once across
+        // the three calls: the memo collapses subsequent calls into the
+        // first call's promise.
+        expect(accountRepo.query).toHaveBeenCalledTimes(1);
+        expect(signEventRepo.query).toHaveBeenCalledTimes(1);
+        expect(relayerRepo.count).toHaveBeenCalledTimes(1);
+        expect(healthRepo.query).toHaveBeenCalledTimes(1);
     });
 });

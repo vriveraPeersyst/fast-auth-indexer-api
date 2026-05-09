@@ -100,7 +100,7 @@ export class PublicKeyAccountsService {
             const latestEventByKey = this.buildLatestEventByKey(events, mpcResults);
 
             const lookupRows = await this.fetchAccountsForKeys(latestEventByKey, lookupConcurrency);
-            const persistStats = await this.persistLinksAndAccounts(events, lookupRows, dbConcurrency);
+            const persistStats = await this.persistLinksAndAccounts(events, lookupRows);
 
             const orphanStats = await this.maybeRunOrphanRetry(lookupConcurrency);
             const backStamped = await this.backStampHistoricalOrphans();
@@ -240,7 +240,6 @@ export class PublicKeyAccountsService {
     private async persistLinksAndAccounts(
         events: EventRow[],
         lookupRows: LookupRow[],
-        dbConcurrency: number,
     ): Promise<{ linkedRows: number; newLinks: number; accountsCreated: number; touchedAccounts: number }> {
         const candidatePairs: Array<{ publicKey: string; accountId: string; meta: PubkeyMeta }> = [];
         const candidateAccountIds = new Set<string>();
@@ -326,13 +325,29 @@ export class PublicKeyAccountsService {
             await this.pkaRepository.createQueryBuilder().insert().values(newLinkRows).orIgnore().execute();
         }
 
-        // Refresh lastSeenAt / lastSourceEventId on every touched (pubkey, accountId).
-        await runWithConcurrencyAbortOnError(candidatePairs, dbConcurrency, async (pair) => {
-            await this.pkaRepository.update(
-                { publicKey: pair.publicKey, accountId: pair.accountId },
-                { lastSeenAt: pair.meta.blockTimestamp, lastSourceEventId: pair.meta.eventId },
+        // Refresh lastSeenAt / lastSourceEventId on every touched (pubkey,
+        // accountId) in a single UPDATE-FROM-VALUES round-trip instead of N
+        // sequential UPDATEs. Bounded by candidatePairs.length (typically a
+        // few hundred at most given DEFAULT_BATCH_SIZE=200), well within
+        // Postgres' 65535-parameter cap.
+        if (candidatePairs.length > 0) {
+            const params: unknown[] = [];
+            const valueTuples: string[] = [];
+            for (const pair of candidatePairs) {
+                const i = params.length;
+                params.push(pair.publicKey, pair.accountId, pair.meta.blockTimestamp, pair.meta.eventId);
+                valueTuples.push(`($${i + 1}::text, $${i + 2}::text, $${i + 3}::timestamp, $${i + 4}::bigint)`);
+            }
+            await this.pkaRepository.query(
+                `UPDATE fastauth_public_key_accounts pka
+                 SET last_seen_at = v.last_seen_at,
+                     last_source_event_id = v.last_source_event_id,
+                     updated_at = NOW()
+                 FROM (VALUES ${valueTuples.join(", ")}) AS v(public_key, account_id, last_seen_at, last_source_event_id)
+                 WHERE pka.public_key = v.public_key AND pka.account_id = v.account_id`,
+                params,
             );
-        });
+        }
 
         // Bulk-insert new accounts (same NOT-NULL-on-timestamp rationale).
         const newAccountRows = [...accountAggregates.entries()]
@@ -375,34 +390,56 @@ export class PublicKeyAccountsService {
             eventIdsByAccount.set(owner.accountId, list);
         }
 
-        await runWithConcurrencyAbortOnError([...eventIdsByAccount.entries()], dbConcurrency, async ([accountId, ids]) => {
-            await this.signEventRepository.update({ id: In(ids) }, { userAccountId: accountId });
-        });
-
-        // Update existing accounts (lastSeenAt + lastSourceEventId + publicKeyCount).
-        const existingAccountUpdates = [...accountAggregates.entries()].filter(([accountId]) => existingAccountSet.has(accountId));
-
-        await runWithConcurrencyAbortOnError(existingAccountUpdates, dbConcurrency, async ([accountId, agg]) => {
-            const updateData: Partial<Account> = {
-                lastSeenAt: agg.lastSeenAt,
-                lastSourceEventId: agg.lastSourceEventId,
-            };
-            if (agg.newLinkCount > 0) {
-                // TypeORM doesn't have a built-in increment in `update`; do a
-                // query-builder UPDATE … SET publicKeyCount = publicKeyCount + N.
-                await this.accountRepository
-                    .createQueryBuilder()
-                    .update(Account)
-                    .set({
-                        ...updateData,
-                        publicKeyCount: () => `public_key_count + ${agg.newLinkCount}`,
-                    })
-                    .where("account_id = :accountId", { accountId })
-                    .execute();
-                return;
+        // Back-stamp user_account_id in a single UPDATE for the whole batch
+        // instead of one query per account. Each event id maps to exactly
+        // one accountId, so a UPDATE … FROM (VALUES …) covers all (eventId,
+        // accountId) pairs in one round-trip.
+        const stampPairs: Array<{ eventId: string; accountId: string }> = [];
+        for (const [accountId, ids] of eventIdsByAccount) {
+            for (const id of ids) stampPairs.push({ eventId: id, accountId });
+        }
+        if (stampPairs.length > 0) {
+            const params: unknown[] = [];
+            const valueTuples: string[] = [];
+            for (const pair of stampPairs) {
+                const i = params.length;
+                params.push(pair.eventId, pair.accountId);
+                valueTuples.push(`($${i + 1}::bigint, $${i + 2}::text)`);
             }
-            await this.accountRepository.update({ accountId }, updateData);
-        });
+            await this.signEventRepository.query(
+                `UPDATE fastauth_sign_events fse
+                 SET user_account_id = v.account_id
+                 FROM (VALUES ${valueTuples.join(", ")}) AS v(event_id, account_id)
+                 WHERE fse.id = v.event_id`,
+                params,
+            );
+        }
+
+        // Update existing accounts (lastSeenAt + lastSourceEventId +
+        // publicKeyCount delta) in a single UPDATE-FROM-VALUES query. The
+        // per-row publicKeyCount delta lives in the values list and is
+        // applied as `public_key_count + v.delta`, so accounts with no new
+        // links get a +0 increment (a no-op).
+        const existingAccountUpdates = [...accountAggregates.entries()].filter(([accountId]) => existingAccountSet.has(accountId));
+        if (existingAccountUpdates.length > 0) {
+            const params: unknown[] = [];
+            const valueTuples: string[] = [];
+            for (const [accountId, agg] of existingAccountUpdates) {
+                const i = params.length;
+                params.push(accountId, agg.lastSeenAt, agg.lastSourceEventId, agg.newLinkCount);
+                valueTuples.push(`($${i + 1}::text, $${i + 2}::timestamp, $${i + 3}::bigint, $${i + 4}::int)`);
+            }
+            await this.accountRepository.query(
+                `UPDATE accounts a
+                 SET last_seen_at = v.last_seen_at,
+                     last_source_event_id = v.last_source_event_id,
+                     public_key_count = a.public_key_count + v.delta,
+                     updated_at = NOW()
+                 FROM (VALUES ${valueTuples.join(", ")}) AS v(account_id, last_seen_at, last_source_event_id, delta)
+                 WHERE a.account_id = v.account_id`,
+                params,
+            );
+        }
 
         return {
             linkedRows,

@@ -35,7 +35,7 @@ describe("PublicKeyAccountsService", () => {
     let signEventRepo: any;
     let pkaRepo: any;
     let accountRepo: any;
-    let checkpoints: { get: jest.Mock; set: jest.Mock };
+    let checkpoints: { get: jest.Mock; set: jest.Mock; setMany: jest.Mock };
     let mpc: { fetchDerivedPublicKey: jest.Mock };
     let lookup: { fetchAccountsForPublicKey: jest.Mock };
     let signEventQb: any;
@@ -51,12 +51,13 @@ describe("PublicKeyAccountsService", () => {
             find: jest.fn().mockResolvedValue([]),
             createQueryBuilder: jest.fn(() => makeInsertQbMock()),
             update: jest.fn().mockResolvedValue({}),
+            query: jest.fn().mockResolvedValue([]),
         };
         accountRepo = {
             find: jest.fn().mockResolvedValue([]),
             createQueryBuilder: jest.fn(() => {
-                // The orchestrator uses createQueryBuilder for both insert + update with expressions.
-                // Return a chainable that handles both shapes.
+                // Used by the new-account INSERT path. Existing-account UPDATEs
+                // go through accountRepo.query (single bulk UPDATE).
                 const qb: any = makeInsertQbMock();
                 qb.update = jest.fn(() => qb);
                 qb.set = jest.fn(() => qb);
@@ -64,8 +65,13 @@ describe("PublicKeyAccountsService", () => {
                 return qb;
             }),
             update: jest.fn().mockResolvedValue({}),
+            query: jest.fn().mockResolvedValue([]),
         };
-        checkpoints = { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue(undefined) };
+        checkpoints = {
+            get: jest.fn().mockResolvedValue(null),
+            set: jest.fn().mockResolvedValue(undefined),
+            setMany: jest.fn().mockResolvedValue(undefined),
+        };
         mpc = { fetchDerivedPublicKey: jest.fn() };
         lookup = { fetchAccountsForPublicKey: jest.fn().mockResolvedValue([]) };
 
@@ -333,7 +339,7 @@ describe("PublicKeyAccountsService", () => {
     });
 
     describe("existing account updates", () => {
-        it("uses the increment query-builder path when an existing account gets new links", async () => {
+        it("issues a single bulk UPDATE for existing accounts with the publicKeyCount delta", async () => {
             await build([
                 {
                     id: "10",
@@ -345,19 +351,21 @@ describe("PublicKeyAccountsService", () => {
                 },
             ]);
             lookup.fetchAccountsForPublicKey.mockResolvedValue(["alice.near"]);
-            // No existing pka link — so the link is "new" (newLinkCount > 0).
+            // No existing pka link — so the link is "new" (delta > 0).
             pkaRepo.find.mockResolvedValue([]);
             // Existing account (alice.near already in accounts table).
             accountRepo.find.mockResolvedValue([{ accountId: "alice.near" }]);
 
             await service.runOnce();
 
-            // The createQueryBuilder branch ran (UPDATE … SET public_key_count = public_key_count + N).
-            const cqbCalls = accountRepo.createQueryBuilder.mock.calls;
-            expect(cqbCalls.length).toBeGreaterThan(0);
+            const updateCalls = accountRepo.query.mock.calls.filter(([sql]: [string]) => sql.includes("UPDATE accounts"));
+            expect(updateCalls.length).toBe(1);
+            // Single UPDATE applies the per-row delta inline; no separate
+            // increment branch needed.
+            expect(updateCalls[0][0]).toMatch(/public_key_count = a\.public_key_count \+ v\.delta/);
         });
 
-        it("uses the simple update path when an existing account has no new links", async () => {
+        it("issues a single bulk UPDATE with delta=0 when an existing account has no new links", async () => {
             await build([
                 {
                     id: "11",
@@ -369,14 +377,18 @@ describe("PublicKeyAccountsService", () => {
                 },
             ]);
             lookup.fetchAccountsForPublicKey.mockResolvedValue(["alice.near"]);
-            // The link already exists → newLinkCount stays 0.
+            // The link already exists → delta stays 0.
             pkaRepo.find.mockResolvedValue([{ publicKey: "ed25519:abc", accountId: "alice.near" }]);
             // Existing account.
             accountRepo.find.mockResolvedValue([{ accountId: "alice.near" }]);
 
             await service.runOnce();
 
-            expect(accountRepo.update).toHaveBeenCalled();
+            const updateCalls = accountRepo.query.mock.calls.filter(([sql]: [string]) => sql.includes("UPDATE accounts"));
+            expect(updateCalls.length).toBe(1);
+            // Delta param = 0 for this account.
+            const params = updateCalls[0][1] as unknown[];
+            expect(params).toContain(0);
         });
     });
 

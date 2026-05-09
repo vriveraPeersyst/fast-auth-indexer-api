@@ -41,8 +41,11 @@ import {
     TopAccountRow,
     TransactionMetrics,
 } from "./dashboard-data.types";
+import { TtlMemo } from "../common/ttl-memo";
 import { MIGRATED_ACCOUNTS_TOTAL } from "./migrated-accounts.constant";
 import { StatusData, StatusFailureDto, StatusUptimeBucket } from "./status.types";
+
+const DASHBOARD_DATA_TTL_MS = 30_000;
 
 const MAX_RELAYER_ROWS = 30;
 const MAX_UNIQUE_SPONSORED_ACCOUNTS_TO_DISPLAY = 12;
@@ -155,6 +158,12 @@ function getCollectorHealthStatus(
 export class DashboardDataService {
     private readonly logger = new Logger(DashboardDataService.name);
 
+    // 30s single-flight memo. /public/dashboard-data fans out into ~80
+    // queries; under any concurrent traffic this collapses repeat hits to a
+    // single fan-out per window. /public/status is just a projection of
+    // getDashboardData(), so it inherits the same cache for free.
+    private readonly dashboardMemo = new TtlMemo<DashboardData>(DASHBOARD_DATA_TTL_MS);
+
     constructor(
         @InjectRepository(Account) private readonly accountRepo: Repository<Account>,
         @InjectRepository(Relayer) private readonly relayerRepo: Repository<Relayer>,
@@ -175,6 +184,10 @@ export class DashboardDataService {
     ) {}
 
     async getDashboardData(): Promise<DashboardData> {
+        return this.dashboardMemo.get(() => this.computeDashboardData());
+    }
+
+    private async computeDashboardData(): Promise<DashboardData> {
         const now = new Date();
         const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
         const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);

@@ -36,7 +36,7 @@ describe("NearIngestService", () => {
     let signEventRepo: any;
     let userTxRepo: any;
     let pkaRepo: any;
-    let checkpoints: { get: jest.Mock; set: jest.Mock };
+    let checkpoints: { get: jest.Mock; set: jest.Mock; setMany: jest.Mock };
     let nearBlock: {
         fetchFinalBlock: jest.Mock;
         fetchBlockByHeight: jest.Mock;
@@ -67,7 +67,11 @@ describe("NearIngestService", () => {
             createQueryBuilder: jest.fn(() => makeSelectQbMock([])),
             query: jest.fn().mockResolvedValue([]),
         };
-        checkpoints = { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue(undefined) };
+        checkpoints = {
+            get: jest.fn().mockResolvedValue(null),
+            set: jest.fn().mockResolvedValue(undefined),
+            setMany: jest.fn().mockResolvedValue(undefined),
+        };
         nearBlock = {
             fetchFinalBlock: jest.fn(),
             fetchBlockByHeight: jest.fn(),
@@ -326,8 +330,13 @@ describe("NearIngestService", () => {
 
         await service.runOnce();
 
-        const setCalls = checkpoints.set.mock.calls.map((call) => call[0]);
-        expect(setCalls).not.toContain("near_backfill_start_origin");
+        // Backfill origin is never written when the checkpoint already
+        // exists. Inspect both single (set) and bulk (setMany) write paths
+        // — chain-head goes through setMany now.
+        const setKeys = checkpoints.set.mock.calls.map((call) => call[0]);
+        const setManyKeys = checkpoints.setMany.mock.calls.flatMap((call) => (call[0] as Array<{ key: string }>).map((e) => e.key));
+        expect(setKeys).not.toContain("near_backfill_start_origin");
+        expect(setManyKeys).not.toContain("near_backfill_start_origin");
     });
 
     it("populates token columns when computeActionsValue returns priced tokens (Path 3a)", async () => {
