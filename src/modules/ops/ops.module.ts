@@ -16,7 +16,14 @@ import { WipeDbService } from "./wipe-db.service";
 
 @Module({
     imports: [
-        TypeOrmModule.forFeature([FastAuthPublicKeyAccount, FastAuthSignEvent, NearTransaction, Relayer, IndexerCheckpoint, MissingBlockRange]),
+        TypeOrmModule.forFeature([
+            FastAuthPublicKeyAccount,
+            FastAuthSignEvent,
+            NearTransaction,
+            Relayer,
+            IndexerCheckpoint,
+            MissingBlockRange,
+        ]),
         CheckpointsModule,
         NearIngestModule,
     ],
