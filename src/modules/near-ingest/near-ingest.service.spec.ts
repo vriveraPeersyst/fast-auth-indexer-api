@@ -442,4 +442,39 @@ describe("NearIngestService", () => {
         expect(result.status).toBe("error");
         expect(result.details).toMatch(/missing block details/);
     });
+
+    describe("runPayloadRetention", () => {
+        it("reports zero compacted when no stale payloads match", async () => {
+            nearTxRepo.query.mockResolvedValue([]);
+
+            const result = await service.runPayloadRetention();
+
+            expect(result.status).toBe("ok");
+            expect(result.inserted).toBe(0);
+            expect(result.details).toMatch(/No near_transactions payloads/);
+            const [sql, params] = nearTxRepo.query.mock.calls[0];
+            expect(sql).toMatch(/payload_json = '\{\}'::jsonb/);
+            // Retention window + batch cap are passed as bound params, not interpolated.
+            expect(params).toEqual(["30", 5000]);
+        });
+
+        it("counts the rows whose payload was compacted", async () => {
+            nearTxRepo.query.mockResolvedValue([{ tx_hash: "a" }, { tx_hash: "b" }, { tx_hash: "c" }]);
+
+            const result = await service.runPayloadRetention();
+
+            expect(result.status).toBe("ok");
+            expect(result.inserted).toBe(3);
+            expect(result.details).toMatch(/Compacted payload_json on 3 near_transactions rows/);
+        });
+
+        it("returns error (not throw) when the UPDATE query fails", async () => {
+            nearTxRepo.query.mockRejectedValue(new Error("deadlock detected"));
+
+            const result = await service.runPayloadRetention();
+
+            expect(result.status).toBe("error");
+            expect(result.details).toContain("deadlock detected");
+        });
+    });
 });

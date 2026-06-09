@@ -14,14 +14,14 @@ function svc(): { runOnce: jest.Mock } {
 
 describe("IndexerSchedulerService", () => {
     let scheduler: IndexerSchedulerService;
-    let nearIngest: { runOnce: jest.Mock };
+    let nearIngest: { runOnce: jest.Mock; runPayloadRetention: jest.Mock };
     let fastauthHealth: { runOnce: jest.Mock };
     let userHealth: { runOnce: jest.Mock };
     let pka: { runOnce: jest.Mock };
     let contractState: { runOnce: jest.Mock };
 
     beforeEach(async () => {
-        nearIngest = svc();
+        nearIngest = { ...svc(), runPayloadRetention: jest.fn() };
         fastauthHealth = svc();
         userHealth = svc();
         pka = svc();
@@ -60,6 +60,15 @@ describe("IndexerSchedulerService", () => {
         expect(userHealth.runOnce).toHaveBeenCalledTimes(1);
         expect(pka.runOnce).toHaveBeenCalledTimes(1);
         expect(contractState.runOnce).toHaveBeenCalledTimes(1);
+    });
+
+    it("delegates the payload-retention tick to nearIngest.runPayloadRetention()", async () => {
+        nearIngest.runPayloadRetention.mockResolvedValue({ source: "near", status: "ok", inserted: 0 });
+
+        await scheduler.tickPayloadRetention();
+
+        expect(nearIngest.runPayloadRetention).toHaveBeenCalledTimes(1);
+        expect(nearIngest.runOnce).not.toHaveBeenCalled();
     });
 
     it("skips a tick when the previous run is still in progress (re-entrancy lock)", async () => {

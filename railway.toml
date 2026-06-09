@@ -1,28 +1,20 @@
-# Railway repo-level config (shared by every service that builds from this repo).
+# Railway repo-level config.
 # https://docs.railway.com/reference/config-as-code
 #
-# Two services deploy from this same source tree, both referencing the same
-# Postgres via DATABASE_URL = ${{fast-auth-indexer-api-DB.DATABASE_URL}}:
+# Single consolidated service: HTTP read API + scheduled indexer crons in one
+# Nest process (see src/worker.module.ts). Replaces the previous two-service
+# (api + worker) topology — kept the worker service, deleted the api service.
 #
-#   1. fast-auth-indexer-api-api      (HTTP read API)
-#        Settings → Deploy → Custom Start Command:  pnpm run start:prod
-#        Settings → Deploy → Healthcheck Path:      /api/health
-#
-#   2. fast-auth-indexer-api-worker   (long-running indexer)
-#        Settings → Deploy → Custom Start Command:  pnpm run worker:prod
-#        Settings → Deploy → Healthcheck Path:      (leave empty — no HTTP surface)
+#   fast-auth-indexer-api  (HTTP + crons, references DATABASE_URL = ${{fast-auth-indexer-api-DB.DATABASE_URL}})
+#     Settings → Deploy → Custom Start Command:  pnpm run worker:prod
+#     Settings → Deploy → Healthcheck Path:      /api/health
+#     Env:  DB_MIGRATIONS_RUN=1   (idempotent CREATE…IF NOT EXISTS)
 #
 # IMPORTANT: this file does NOT define [deploy].startCommand because that
-# would override every service's per-UI setting (Railway repo-level toml
-# wins over service-UI overrides). Set start command + healthcheck per
-# service in the dashboard.
+# would override the service's per-UI setting (Railway repo-level toml wins
+# over service-UI overrides). Set start command + healthcheck in the dashboard.
 #
-# Both services share the build via Nixpacks (auto-detects pnpm via the
-# packageManager field in package.json).
-#
-# Migrations: the API service runs them on first boot via `DB_MIGRATIONS_RUN=1`
-# (idempotent CREATE…IF NOT EXISTS); the worker sets `DB_MIGRATIONS_RUN=0`
-# so only one service owns migrations.
+# Build via Nixpacks (auto-detects pnpm via the packageManager field).
 
 [build]
 builder = "NIXPACKS"
