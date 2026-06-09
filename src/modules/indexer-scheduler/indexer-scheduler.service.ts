@@ -26,27 +26,34 @@ export class IndexerSchedulerService {
         private readonly contractState: FastauthContractStateService,
     ) {}
 
-    @Cron("0 */2 * * * *", { name: "near-ingest" })
+    // Cadences kept tight so near-ingest runs near-continuously: at 30s the
+    // re-entrancy lock simply skips ticks while a 500-block batch is in flight,
+    // so effective throughput is runtime-bound (back-to-back batches) rather
+    // than gated by the cron interval. Relaxing this interval inserts idle
+    // gaps between batches and the indexer falls behind the chain tip — and it
+    // saves nothing on the bill, which is dominated by DB RAM (data growth),
+    // not worker CPU / RPC egress.
+    @Cron("0,30 * * * * *", { name: "near-ingest" })
     async tickNearIngest(): Promise<void> {
         await this.runWithLock("near-ingest", () => this.nearIngest.runOnce());
     }
 
-    @Cron("0 */5 * * * *", { name: "health-fastauth" })
+    @Cron("5,35 * * * * *", { name: "health-fastauth" })
     async tickFastauthHealth(): Promise<void> {
         await this.runWithLock("health-fastauth", () => this.fastauthHealth.runOnce());
     }
 
-    @Cron("30 */5 * * * *", { name: "health-user" })
+    @Cron("15,45 * * * * *", { name: "health-user" })
     async tickUserHealth(): Promise<void> {
         await this.runWithLock("health-user", () => this.userHealth.runOnce());
     }
 
-    @Cron("15 */5 * * * *", { name: "pka" })
+    @Cron("25 * * * * *", { name: "pka" })
     async tickPka(): Promise<void> {
         await this.runWithLock("pka", () => this.pka.runOnce());
     }
 
-    @Cron("0 */15 * * * *", { name: "contract-state" })
+    @Cron("0 */5 * * * *", { name: "contract-state" })
     async tickContractState(): Promise<void> {
         await this.runWithLock("contract-state", () => this.contractState.runOnce());
     }
