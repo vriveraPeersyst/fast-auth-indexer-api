@@ -13,19 +13,12 @@ import * as packageJson from "../package.json";
 async function bootstrap() {
     const app = await NestFactory.create(AppModule);
     const configService = app.get(ConfigService);
-    const logLevel = configService.get("logger.logLevel");
-    const logFileName = configService.get("logger.logFileName");
     const serverPort = configService.get("server.port");
 
     const logger = WinstonModule.createLogger({
         transports: [
             new winston.transports.Console({
                 format: winston.format.combine(winston.format.timestamp(), nestWinstonModuleUtilities.format.nestLike()),
-            }),
-            new winston.transports.File({
-                format: winston.format.combine(winston.format.timestamp(), nestWinstonModuleUtilities.format.nestLike()),
-                level: logLevel,
-                filename: logFileName,
             }),
         ],
     });

@@ -1,23 +1,29 @@
 import { Module } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
+import { APP_FILTER } from "@nestjs/core";
 import { ScheduleModule } from "@nestjs/schedule";
 import { TypeOrmModule } from "@nestjs/typeorm";
 
 import configuration from "./config/configuration";
+import { ErrorFilter } from "./modules/common/exception/error.filter";
+import { DashboardModule } from "./modules/dashboard/dashboard.module";
 import { FastauthContractStateModule } from "./modules/fastauth-contract-state/fastauth-contract-state.module";
+import { HealthApiModule } from "./modules/health-api/health-api.module";
 import { HealthModule } from "./modules/health/health.module";
 import { IndexerSchedulerModule } from "./modules/indexer-scheduler/indexer-scheduler.module";
+import { IndexerTriggerModule } from "./modules/indexer-trigger/indexer-trigger.module";
 import { NearIngestModule } from "./modules/near-ingest/near-ingest.module";
+import { OpsModule } from "./modules/ops/ops.module";
 import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-key-accounts.module";
 
 /**
- * Long-running indexer worker process. Mirrors AppModule's TypeORM + config
- * wiring but skips the HTTP API surface. Imports only the indexer domain
- * modules + the scheduler that fires their `runOnce()` on cron cadences.
+ * Consolidated single-process app: HTTP read API + scheduled indexer crons.
  *
- * Deploy as a separate Railway service with start command
- *   `pnpm run worker:prod`
- * referencing the same `DATABASE_URL` as the API service.
+ * Previously two Railway services shared this codebase (one running
+ * `start:prod` for HTTP-only, one running `worker:prod` for crons-only). They
+ * each carried a baseline-RAM cost 24/7. Now both responsibilities live in a
+ * single Nest app booted from `worker.ts` — delete the API service in Railway,
+ * point the worker service's healthcheck at `/api/health`.
  */
 @Module({
     imports: [
@@ -32,11 +38,18 @@ import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-ke
             useFactory: (config: ConfigService) => config.get("database") as any,
         }),
         ScheduleModule.forRoot(),
+        // Domain modules
         FastauthContractStateModule,
         HealthModule,
         NearIngestModule,
         PublicKeyAccountsModule,
+        OpsModule,
         IndexerSchedulerModule,
+        // HTTP API modules
+        HealthApiModule,
+        IndexerTriggerModule,
+        DashboardModule,
     ],
+    providers: [{ provide: APP_FILTER, useClass: ErrorFilter }],
 })
 export class WorkerModule {}
