@@ -42,6 +42,17 @@ const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
 // anti-join continue to work.
 const NEAR_PAYLOAD_RETENTION_DAYS = 30;
 const NEAR_PAYLOAD_COMPACT_BATCH = 5_000;
+// The relayer mart is a full-table re-aggregation of fastauth_sign_events
+// (3 GROUP BYs + DELETE/re-INSERT) whose cost grows with the table. Running it
+// every cycle that persisted events dominates per-run overhead during tip
+// catch-up. Throttle to at most once per this interval; a dirty flag ensures a
+// pending rebuild still fires even if the threshold is crossed on a later
+// cycle that happened to persist no new events. The dashboard relayer view
+// tolerates this staleness. The interval must exceed a typical run duration
+// for the throttle to actually skip rebuilds (an RPC-bound run can take
+// minutes), so it's set well above that — relayer aggregates don't need to be
+// fresher than ~10 min.
+const RELAYER_MART_REBUILD_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
 const CHECKPOINT_HEIGHT = "near_last_final_block_height";
 const CHECKPOINT_HASH = "near_last_final_block_hash";
@@ -92,6 +103,11 @@ export class NearIngestService {
     // written), we never need to re-read it — its value is invariant after
     // the first cycle. Saves one SELECT per cycle.
     private backfillOriginObserved = false;
+    // Relayer-mart throttle state (see RELAYER_MART_REBUILD_MIN_INTERVAL_MS).
+    // In-memory is sufficient: a process restart just triggers one rebuild on
+    // the next cycle with events, which is harmless.
+    private lastMartRebuildAtMs = 0;
+    private martDirty = false;
 
     constructor(
         @InjectRepository(NearTransaction) private readonly nearTxRepository: Repository<NearTransaction>,
@@ -210,7 +226,18 @@ export class NearIngestService {
                 await this.persistRunCheckpoints(highestContiguous, stats);
             }
 
-            const martCounts = stats.indexedSignEvents > 0 ? await this.relayerMarts.rebuild() : { relayers: 0 };
+            // Mark the mart dirty when this cycle persisted sign events, then
+            // rebuild only if the throttle window has elapsed. This keeps the
+            // expensive full-table re-aggregation off the hot path during
+            // catch-up while still converging within the interval.
+            if (stats.indexedSignEvents > 0) this.martDirty = true;
+            const nowMs = Date.now();
+            let martCounts: { relayers: number } | null = null;
+            if (this.martDirty && nowMs - this.lastMartRebuildAtMs >= RELAYER_MART_REBUILD_MIN_INTERVAL_MS) {
+                martCounts = await this.relayerMarts.rebuild();
+                this.lastMartRebuildAtMs = nowMs;
+                this.martDirty = false;
+            }
 
             const detailsBase =
                 `Processed block heights ${startHeight}..${targetHeight}` +
@@ -218,7 +245,7 @@ export class NearIngestService {
                 `; indexed ${stats.indexedTransactions} transactions, ` +
                 `${stats.indexedSignEvents} sign events, ` +
                 `${stats.indexedUserTxs} user-activity txs; ` +
-                `rebuilt marts (${martCounts.relayers} relayers); ` +
+                (martCounts ? `rebuilt marts (${martCounts.relayers} relayers); ` : `marts deferred; `) +
                 `skipped ${stats.skippedHeights} empty heights.`;
 
             if (runError !== null) {
