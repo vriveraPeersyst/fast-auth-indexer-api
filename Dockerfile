@@ -22,4 +22,4 @@ RUN pnpm install --frozen-lockfile --prod
 COPY --from=builder /app/dist ./dist
 
 EXPOSE 3000
-CMD ["node", "--max-old-space-size=768", "./dist/src/worker.js"]
+CMD ["node", "--max-old-space-size=2048", "./dist/src/worker.js"]
