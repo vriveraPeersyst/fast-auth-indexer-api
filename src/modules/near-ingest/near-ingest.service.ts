@@ -8,7 +8,7 @@ import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { CheckpointsService } from "../common/checkpoints/checkpoints.service";
-import { runWithConcurrencyAbortOnError } from "../common/concurrency";
+import { runWithConcurrency, runWithConcurrencyAbortOnError } from "../common/concurrency";
 import { IndexerRunResult } from "../common/indexer-run-result";
 import { PricingService, TokenRegistry } from "../common/pricing/pricing.service";
 import {
@@ -30,8 +30,13 @@ const SOURCE = "near";
 // been collapsed into source constants because they are deployment-invariant.
 // Change them in code, not via env vars.
 const NEAR_MAX_BLOCKS_PER_RUN = 500;
-const NEAR_BLOCK_CONCURRENCY = 20;
-const NEAR_CHUNK_CONCURRENCY = 6;
+// Tuned for free public NEAR RPC endpoints, which 429 under bursty load. Peak
+// concurrent RPC calls ≈ NEAR_BLOCK_CONCURRENCY × NEAR_CHUNK_CONCURRENCY, so
+// these are kept modest to stay under per-endpoint rate limits. If 429s still
+// dominate the logs, lower them further; if the pool gains capacity (more/
+// authenticated endpoints), they can go back up to catch up faster.
+const NEAR_BLOCK_CONCURRENCY = 10;
+const NEAR_CHUNK_CONCURRENCY = 4;
 const NEAR_BACKFILL_START_HEIGHT = 194_800_000;
 const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
 // Payload retention — `near_transactions.payload_json` holds the full action
@@ -193,9 +198,17 @@ export class NearIngestService {
             for (let h = startHeight; h <= targetHeight; h += 1) heights.push(h);
 
             const startedAt = Date.now();
-            let runError: unknown = null;
-            try {
-                await runWithConcurrencyAbortOnError(heights, NEAR_BLOCK_CONCURRENCY, async (height) => {
+            // Tolerant block walk: a per-height RPC failure (typically a 429
+            // from a rate-limited free endpoint) must NOT abort the whole
+            // batch — that was discarding ~450 of every 500 blocks and the
+            // indexer fell behind the chain tip. Instead each failed height is
+            // recorded and left out of `completedHeights`, so the contiguous
+            // checkpoint stops just before the first hole and those heights are
+            // retried next run. Everything fetchable still commits this run.
+            const failedHeights: number[] = [];
+            let lastHeightError: unknown = null;
+            await runWithConcurrency(heights, NEAR_BLOCK_CONCURRENCY, async (height) => {
+                try {
                     await this.processBlockHeight({
                         height,
                         latestHeight,
@@ -209,10 +222,11 @@ export class NearIngestService {
                         startedAt,
                         totalPlanned: heights.length,
                     });
-                });
-            } catch (error) {
-                runError = error;
-            }
+                } catch (error) {
+                    failedHeights.push(height);
+                    lastHeightError = error;
+                }
+            });
 
             // Advance checkpoints only to the highest contiguous completed
             // height. Holes (e.g. 429 in the middle of the window) stop the
@@ -239,6 +253,13 @@ export class NearIngestService {
                 this.martDirty = false;
             }
 
+            const deferredNote =
+                failedHeights.length > 0
+                    ? `; deferred ${failedHeights.length} heights to next run (e.g. height ${failedHeights[0]}: ${
+                          lastHeightError instanceof Error ? lastHeightError.message : String(lastHeightError)
+                      })`
+                    : "";
+
             const detailsBase =
                 `Processed block heights ${startHeight}..${targetHeight}` +
                 (targetHeight < latestHeight ? ` (latest is ${latestHeight})` : "") +
@@ -246,17 +267,10 @@ export class NearIngestService {
                 `${stats.indexedSignEvents} sign events, ` +
                 `${stats.indexedUserTxs} user-activity txs; ` +
                 (martCounts ? `rebuilt marts (${martCounts.relayers} relayers); ` : `marts deferred; `) +
-                `skipped ${stats.skippedHeights} empty heights.`;
-
-            if (runError !== null) {
-                const message = runError instanceof Error ? runError.message : "Unknown NEAR collector error.";
-                return {
-                    source: SOURCE,
-                    status: "error",
-                    inserted: stats.indexedTransactions,
-                    details: `${message} | Partial progress: persisted up to height ${highestContiguous} (latest persisted ${stats.latestPersistedHeight}); ${detailsBase}`,
-                };
-            }
+                `skipped ${stats.skippedHeights} empty heights` +
+                `; persisted up to height ${highestContiguous}` +
+                deferredNote +
+                ".";
 
             return {
                 source: SOURCE,

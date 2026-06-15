@@ -200,7 +200,7 @@ describe("NearIngestService", () => {
         expect(result.details).toMatch(/skipped 1 empty heights/);
     });
 
-    it("rethrows non-skippable RPC errors and returns partial-progress error", async () => {
+    it("defers non-skippable RPC failures to the next run instead of aborting the batch", async () => {
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
             result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
@@ -214,9 +214,12 @@ describe("NearIngestService", () => {
 
         const result = await service.runOnce();
 
-        expect(result.status).toBe("error");
+        // Tolerant walk: the failed height is deferred (not a fatal error),
+        // the run still reports ok so the scheduler doesn't log it as an error
+        // every cycle during normal rate-limit backpressure.
+        expect(result.status).toBe("ok");
         expect(result.details).toContain("hard fail");
-        expect(result.details).toContain("Partial progress");
+        expect(result.details).toMatch(/deferred 1 heights/);
     });
 
     it("rebuilds marts only when sign events were indexed", async () => {
@@ -476,7 +479,7 @@ describe("NearIngestService", () => {
         expect(userTxRepo.createQueryBuilder).toHaveBeenCalled();
     });
 
-    it("throws when block payload is missing height/hash for a non-latest height", async () => {
+    it("defers a height whose block payload is missing height/hash (non-latest)", async () => {
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
             result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
@@ -489,8 +492,11 @@ describe("NearIngestService", () => {
 
         const result = await service.runOnce();
 
-        expect(result.status).toBe("error");
+        // The malformed height is deferred (left out of the contiguous advance)
+        // and retried next run, rather than aborting the whole batch.
+        expect(result.status).toBe("ok");
         expect(result.details).toMatch(/missing block details/);
+        expect(result.details).toMatch(/deferred 1 heights/);
     });
 
     describe("runPayloadRetention", () => {
