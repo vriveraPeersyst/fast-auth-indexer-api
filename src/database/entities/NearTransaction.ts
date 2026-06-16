@@ -38,9 +38,6 @@ export class NearTransaction {
     @Column("text", { name: "attached_deposit_yocto", nullable: true })
     attachedDepositYocto: string | null;
 
-    @Column("jsonb", { name: "payload_json" })
-    payload: Record<string, any>;
-
     @CreateDateColumn({ name: "created_at", type: "timestamp", precision: 3 })
     createdAt: Date;
 

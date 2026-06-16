@@ -9,7 +9,6 @@ import {
     sha256,
     toDateFromNearNs,
     toNullableBigInt,
-    toTransactionPayload,
 } from "./conversion.helpers";
 
 describe("toDateFromNearNs", () => {
@@ -151,18 +150,5 @@ describe("decodeBase64UrlToUtf8", () => {
         const standard = Buffer.from('{"a":1}').toString("base64").replace(/=+$/, "");
         const urlSafe = standard.replace(/\+/g, "-").replace(/\//g, "_");
         expect(decodeBase64UrlToUtf8(urlSafe)).toBe('{"a":1}');
-    });
-});
-
-describe("toTransactionPayload", () => {
-    it("preserves all input fields", () => {
-        const tx = { hash: "h", signer_id: "s", public_key: "k", receiver_id: "r", actions: [{ Transfer: {} }] };
-        const result = toTransactionPayload(tx);
-        expect(result).toMatchObject({ hash: "h", signer_id: "s", public_key: "k", receiver_id: "r" });
-        expect(result.actions).toHaveLength(1);
-    });
-    it("defaults missing fields to null and actions to []", () => {
-        const result = toTransactionPayload({});
-        expect(result).toEqual({ hash: null, signer_id: null, public_key: null, receiver_id: null, actions: [] });
     });
 });

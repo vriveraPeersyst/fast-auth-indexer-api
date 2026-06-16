@@ -16,7 +16,6 @@ import {
     parseExecutionStatus,
     toDateFromNearNs,
     toNullableBigInt,
-    toTransactionPayload,
     normalizeNearPublicKey,
 } from "./conversion.helpers";
 import { extractDelegateActionInfo } from "./delegate.helpers";
@@ -39,14 +38,6 @@ const NEAR_BLOCK_CONCURRENCY = 10;
 const NEAR_CHUNK_CONCURRENCY = 4;
 const NEAR_BACKFILL_START_HEIGHT = 194_800_000;
 const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
-// Payload retention — `near_transactions.payload_json` holds the full action
-// array per tx (only used by the indexer at write time, never read by API or
-// downstream marts). We compact it to `'{}'::jsonb` after this many days to
-// reclaim Postgres storage. Row metadata (signer/receiver/method/status/etc.)
-// is preserved so the dashboard's recent-tx list and the health discovery
-// anti-join continue to work.
-const NEAR_PAYLOAD_RETENTION_DAYS = 30;
-const NEAR_PAYLOAD_COMPACT_BATCH = 5_000;
 // The relayer mart is a full-table re-aggregation of fastauth_sign_events
 // (3 GROUP BYs + DELETE/re-INSERT) whose cost grows with the table. Running it
 // every cycle that persisted events dominates per-run overhead during tip
@@ -582,7 +573,6 @@ export class NearIngestService {
                 failureReason,
                 gasBurnt: gasBurnt?.toString() ?? null,
                 attachedDepositYocto,
-                payload: toTransactionPayload(tx),
             });
 
             for (const seed of seeds) {
@@ -697,46 +687,6 @@ export class NearIngestService {
     private async bulkInsert<T>(repo: Repository<T>, rows: any[]): Promise<number> {
         const result = await repo.createQueryBuilder().insert().values(rows).orIgnore().execute();
         return result.identifiers?.length ?? rows.length;
-    }
-
-    /**
-     * Compact `payload_json` to an empty object for rows older than the
-     * retention window. Bounded per call (NEAR_PAYLOAD_COMPACT_BATCH) so a
-     * one-off historical sweep doesn't lock the table — incremental runs
-     * eventually drain the backlog.
-     */
-    async runPayloadRetention(): Promise<IndexerRunResult> {
-        try {
-            const result = await this.nearTxRepository.query<Array<{ tx_hash: string }>>(
-                `WITH stale AS (
-                    SELECT tx_hash
-                    FROM near_transactions
-                    WHERE block_timestamp < NOW() - ($1 || ' days')::interval
-                      AND payload_json <> '{}'::jsonb
-                    LIMIT $2
-                )
-                UPDATE near_transactions n
-                   SET payload_json = '{}'::jsonb
-                  FROM stale
-                 WHERE n.tx_hash = stale.tx_hash
-                RETURNING n.tx_hash`,
-                [String(NEAR_PAYLOAD_RETENTION_DAYS), NEAR_PAYLOAD_COMPACT_BATCH],
-            );
-            const compacted = Array.isArray(result) ? result.length : 0;
-            return {
-                source: SOURCE,
-                status: "ok",
-                inserted: compacted,
-                details:
-                    compacted === 0
-                        ? `No near_transactions payloads older than ${NEAR_PAYLOAD_RETENTION_DAYS}d to compact.`
-                        : `Compacted payload_json on ${compacted} near_transactions rows older than ${NEAR_PAYLOAD_RETENTION_DAYS}d.`,
-            };
-        } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            this.logger.error(`near-payload-retention failed: ${message}`);
-            return { source: SOURCE, status: "error", details: message };
-        }
     }
 
     private async persistRunCheckpoints(
