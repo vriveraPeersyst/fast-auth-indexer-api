@@ -200,7 +200,7 @@ describe("NearIngestService", () => {
         expect(result.details).toMatch(/skipped 1 empty heights/);
     });
 
-    it("rethrows non-skippable RPC errors and returns partial-progress error", async () => {
+    it("defers non-skippable RPC failures to the next run instead of aborting the batch", async () => {
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
             result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
@@ -214,9 +214,12 @@ describe("NearIngestService", () => {
 
         const result = await service.runOnce();
 
-        expect(result.status).toBe("error");
+        // Tolerant walk: the failed height is deferred (not a fatal error),
+        // the run still reports ok so the scheduler doesn't log it as an error
+        // every cycle during normal rate-limit backpressure.
+        expect(result.status).toBe("ok");
         expect(result.details).toContain("hard fail");
-        expect(result.details).toContain("Partial progress");
+        expect(result.details).toMatch(/deferred 1 heights/);
     });
 
     it("rebuilds marts only when sign events were indexed", async () => {
@@ -235,6 +238,56 @@ describe("NearIngestService", () => {
         await service.runOnce();
 
         expect(relayerMarts.rebuild).not.toHaveBeenCalled();
+    });
+
+    // Sets up a single FA-receiver `sign` tx so each runOnce() persists sign
+    // events (and thus marks the mart dirty). Mirrors the Path 1 test.
+    function primeFaReceiverCycle(): void {
+        const baseHeight = 200_000_000;
+        nearBlock.fetchFinalBlock.mockResolvedValue({
+            result: { header: { height: baseHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [{ chunk_hash: "c1" }] },
+        });
+        checkpoints.get.mockImplementation((k: string) => {
+            if (k === "near_last_scanned_height") return String(baseHeight - 1);
+            return null;
+        });
+        nearBlock.fetchBlockByHeight.mockResolvedValue({
+            result: { header: { height: baseHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [{ chunk_hash: "c1" }] },
+        });
+        const args = Buffer.from(JSON.stringify({ guard_id: "jwt#auth0", algorithm: "ecdsa" })).toString("base64");
+        nearBlock.fetchChunkByHash.mockResolvedValue({
+            result: {
+                transactions: [
+                    {
+                        hash: "fa-tx",
+                        signer_id: "relayer.near",
+                        public_key: "ed25519:rk",
+                        receiver_id: "fast-auth.near",
+                        actions: [{ FunctionCall: { method_name: "sign", args, deposit: "0" } }],
+                        outcome: { outcome: { gas_burnt: 100, status: { SuccessValue: "" } } },
+                    },
+                ],
+            },
+        });
+    }
+
+    it("rebuilds the relayer mart on the first cycle that persists sign events", async () => {
+        primeFaReceiverCycle();
+
+        const result = await service.runOnce();
+
+        expect(relayerMarts.rebuild).toHaveBeenCalledTimes(1);
+        expect(result.details).toMatch(/rebuilt marts/);
+    });
+
+    it("defers the mart rebuild on a later cycle within the throttle window", async () => {
+        primeFaReceiverCycle();
+
+        await service.runOnce(); // first cycle rebuilds and stamps lastMartRebuildAt
+        const result = await service.runOnce(); // immediate second cycle is throttled
+
+        expect(relayerMarts.rebuild).toHaveBeenCalledTimes(1);
+        expect(result.details).toMatch(/marts deferred/);
     });
 
     it("indexes a Path 3a user-direct activity tx when signer is a known FA account", async () => {
@@ -426,7 +479,7 @@ describe("NearIngestService", () => {
         expect(userTxRepo.createQueryBuilder).toHaveBeenCalled();
     });
 
-    it("throws when block payload is missing height/hash for a non-latest height", async () => {
+    it("defers a height whose block payload is missing height/hash (non-latest)", async () => {
         const latestHeight = 200_000_000;
         nearBlock.fetchFinalBlock.mockResolvedValue({
             result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
@@ -439,8 +492,11 @@ describe("NearIngestService", () => {
 
         const result = await service.runOnce();
 
-        expect(result.status).toBe("error");
+        // The malformed height is deferred (left out of the contiguous advance)
+        // and retried next run, rather than aborting the whole batch.
+        expect(result.status).toBe("ok");
         expect(result.details).toMatch(/missing block details/);
+        expect(result.details).toMatch(/deferred 1 heights/);
     });
 
     describe("runPayloadRetention", () => {

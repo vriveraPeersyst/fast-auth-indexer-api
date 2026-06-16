@@ -3,6 +3,11 @@ import { Injectable, Logger } from "@nestjs/common";
 const TOKENS_URL = "https://1click.chaindefuser.com/v0/tokens";
 const FETCH_TIMEOUT_MS = 8_000;
 const NATIVE_NEAR_DECIMALS = 24;
+// Token prices move slowly relative to the indexer's sub-minute cycle, and
+// refresh() sits on the ingest critical path (awaited before block walking).
+// Serve the cached registry for this long before re-fetching so back-to-back
+// ingest cycles don't each pay an external HTTP round-trip.
+const REFRESH_TTL_MS = 5 * 60 * 1000;
 
 export type TokenInfo = {
     contractAddress: string;
@@ -53,6 +58,11 @@ export class PricingService {
     private cached: TokenRegistry | null = null;
 
     async refresh(): Promise<TokenRegistry | null> {
+        // Short-circuit when the cached registry is still fresh — avoids an
+        // external fetch on every sub-minute ingest cycle.
+        if (this.cached && Date.now() - this.cached.fetchedAt.getTime() < REFRESH_TTL_MS) {
+            return this.cached;
+        }
         try {
             const tokens = await this.fetchTokenList();
             this.cached = this.buildRegistry(tokens);
