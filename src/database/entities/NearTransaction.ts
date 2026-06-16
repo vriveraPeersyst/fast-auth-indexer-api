@@ -2,7 +2,6 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColum
 
 @Index("near_transactions_pkey", ["txHash"], { unique: true })
 @Index("near_transactions_block_height_idx", ["blockHeight"], {})
-@Index("near_transactions_receiver_block_height_idx", ["receiverId", "blockHeight"], {})
 @Entity("near_transactions", { schema: "public" })
 export class NearTransaction {
     @PrimaryColumn("text", { name: "tx_hash" })
@@ -37,9 +36,6 @@ export class NearTransaction {
 
     @Column("text", { name: "attached_deposit_yocto", nullable: true })
     attachedDepositYocto: string | null;
-
-    @Column("jsonb", { name: "payload_json" })
-    payload: Record<string, any>;
 
     @CreateDateColumn({ name: "created_at", type: "timestamp", precision: 3 })
     createdAt: Date;

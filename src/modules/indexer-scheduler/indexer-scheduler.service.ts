@@ -8,7 +8,7 @@ import { UserHealthService } from "../health/user-health.service";
 import { NearIngestService } from "../near-ingest/near-ingest.service";
 import { PublicKeyAccountsService } from "../public-key-accounts/public-key-accounts.service";
 
-type Task = "near-ingest" | "health-fastauth" | "health-user" | "pka" | "contract-state" | "payload-retention";
+type Task = "near-ingest" | "health-fastauth" | "health-user" | "pka" | "contract-state";
 
 const MAX_INFLIGHT_TASKS = 4;
 
@@ -56,11 +56,6 @@ export class IndexerSchedulerService {
     @Cron("0 */5 * * * *", { name: "contract-state" })
     async tickContractState(): Promise<void> {
         await this.runWithLock("contract-state", () => this.contractState.runOnce());
-    }
-
-    @Cron("0 7 * * * *", { name: "payload-retention" })
-    async tickPayloadRetention(): Promise<void> {
-        await this.runWithLock("payload-retention", () => this.nearIngest.runPayloadRetention());
     }
 
     async runWithLock(task: Task, fn: () => Promise<IndexerRunResult>): Promise<IndexerRunResult | null> {

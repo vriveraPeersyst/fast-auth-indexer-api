@@ -2,10 +2,6 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryColumn } from "typeorm"
 
 @Index("fastauth_user_transactions_pkey", ["txHash"], { unique: true })
 @Index("fastauth_user_transactions_block_timestamp_idx", ["blockTimestamp"], {})
-@Index("fastauth_user_transactions_signer_block_ts_idx", ["signerAccountId", "blockTimestamp"], {})
-@Index("fastauth_user_transactions_receiver_block_ts_idx", ["receiverId", "blockTimestamp"], {})
-@Index("fastauth_user_transactions_method_block_ts_idx", ["methodName", "blockTimestamp"], {})
-@Index("fastauth_user_transactions_status_block_ts_idx", ["executionStatus", "blockTimestamp"], {})
 @Index("fastauth_user_transactions_value_usd_idx", ["valueUsd"], {})
 @Entity("fastauth_user_transactions", { schema: "public" })
 export class FastAuthUserTransaction {

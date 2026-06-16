@@ -123,20 +123,3 @@ export function parseJsonObject(value: string | null): Record<string, unknown> |
         return null;
     }
 }
-
-/** Build the `payload_json` jsonb column shape from a NEAR chunk transaction. */
-export function toTransactionPayload(tx: {
-    hash?: string;
-    signer_id?: string;
-    public_key?: string;
-    receiver_id?: string;
-    actions?: unknown[];
-}): Record<string, any> {
-    return {
-        hash: tx.hash ?? null,
-        signer_id: tx.signer_id ?? null,
-        public_key: tx.public_key ?? null,
-        receiver_id: tx.receiver_id ?? null,
-        actions: Array.isArray(tx.actions) ? tx.actions : [],
-    };
-}
