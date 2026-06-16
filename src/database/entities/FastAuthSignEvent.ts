@@ -4,11 +4,9 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, Update
 @Index("fastauth_sign_events_tx_action_unique", ["txHash", "actionIndex"], { unique: true })
 @Index("fastauth_sign_events_block_timestamp_idx", ["blockTimestamp"], {})
 @Index("fastauth_sign_events_relayer_block_ts_idx", ["relayerAccountId", "blockTimestamp"], {})
-@Index("fastauth_sign_events_relayer_pubkey_block_ts_idx", ["relayerPublicKey", "blockTimestamp"], {})
 @Index("fastauth_sign_events_user_pubkey_block_ts_idx", ["userDerivedPublicKey", "blockTimestamp"], {})
 @Index("fastauth_sign_events_user_account_block_ts_idx", ["userAccountId", "blockTimestamp"], {})
 @Index("fastauth_sign_events_action_type_block_ts_idx", ["signActionType", "blockTimestamp"], {})
-@Index("fastauth_sign_events_dapp_block_ts_idx", ["projectDappId", "blockTimestamp"], {})
 @Index("fastauth_sign_events_provider_block_ts_idx", ["providerType", "blockTimestamp"], {})
 @Entity("fastauth_sign_events", { schema: "public" })
 export class FastAuthSignEvent {

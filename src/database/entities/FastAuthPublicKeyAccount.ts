@@ -3,7 +3,6 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryGeneratedColumn, Update
 @Index("fastauth_public_key_accounts_pkey", ["id"], { unique: true })
 @Index("fastauth_public_key_accounts_pubkey_account_unique", ["publicKey", "accountId"], { unique: true })
 @Index("fastauth_public_key_accounts_account_idx", ["accountId"], {})
-@Index("fastauth_public_key_accounts_key_path_idx", ["keyPath"], {})
 @Index("fastauth_public_key_accounts_last_seen_idx", ["lastSeenAt"], {})
 @Index("fastauth_public_key_accounts_first_seen_idx", ["firstSeenAt"], {})
 @Entity("fastauth_public_key_accounts", { schema: "public" })

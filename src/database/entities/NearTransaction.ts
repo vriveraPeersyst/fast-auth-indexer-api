@@ -2,7 +2,6 @@ import { Column, CreateDateColumn, Entity, Index, PrimaryColumn, UpdateDateColum
 
 @Index("near_transactions_pkey", ["txHash"], { unique: true })
 @Index("near_transactions_block_height_idx", ["blockHeight"], {})
-@Index("near_transactions_receiver_block_height_idx", ["receiverId", "blockHeight"], {})
 @Entity("near_transactions", { schema: "public" })
 export class NearTransaction {
     @PrimaryColumn("text", { name: "tx_hash" })
