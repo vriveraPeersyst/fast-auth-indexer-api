@@ -622,6 +622,8 @@ export class NearIngestService {
                         methodName: m,
                         actionTypes,
                         metaWrapped: false,
+                        // Self-signed (direct) user tx — no relayer.
+                        relayerAccountId: null,
                         valueUsd: computed.totalUsd !== null ? String(computed.totalUsd) : null,
                         tokenSymbols: computed.tokens.map((t) => t.symbol),
                         tokenAmounts: computed.tokens.map((t) => t.rawAmount),
@@ -653,6 +655,8 @@ export class NearIngestService {
                         methodName: delegateInfo.innerMethodName,
                         actionTypes: delegateInfo.innerActionTypes,
                         metaWrapped: true,
+                        // Outer signer = the relayer that sponsored this meta-tx.
+                        relayerAccountId: txSignerLower,
                         valueUsd: computed.totalUsd !== null ? String(computed.totalUsd) : null,
                         tokenSymbols: computed.tokens.map((t) => t.symbol),
                         tokenAmounts: computed.tokens.map((t) => t.rawAmount),
