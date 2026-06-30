@@ -365,6 +365,15 @@ describe("NearIngestService", () => {
         await service.runOnce();
 
         expect(userTxRepo.createQueryBuilder).toHaveBeenCalled();
+        // The outer signer (relayer) must be recorded on the meta-tx row so the
+        // By-relayer breakdown can attribute it.
+        const insertedUserTxRows = userTxRepo.createQueryBuilder.mock.results[0].value.values.mock.calls[0][0];
+        expect(insertedUserTxRows[0]).toMatchObject({
+            txHash: "meta-tx",
+            signerAccountId: "alice.near",
+            metaWrapped: true,
+            relayerAccountId: "relayer.near",
+        });
     });
 
     it("preserves existing backfill-start-origin checkpoint", async () => {

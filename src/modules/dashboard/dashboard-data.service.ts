@@ -1320,6 +1320,19 @@ export class DashboardDataService {
             .sort((a, b) => b.last30d.total - a.last30d.total);
     }
 
+    /**
+     * By-relayer breakdown — a partition of `fastauth_user_transactions` (the
+     * same on-chain user-tx universe as the By receiver/method/provider/guard
+     * tabs), grouped by the relayer that sponsored each meta-transaction.
+     *
+     * Sourced from user transactions (not `fastauth_sign_events`) so relayers
+     * that work via relayed meta-txns — e.g. AddKey delegates from
+     * relayer.nearmobile.near — reflect their real volume. Sign calls live in a
+     * disjoint table and are excluded from user transactions at ingest, so each
+     * relayed on-chain tx is counted exactly once. Failures come from
+     * `fastauth_user_health_tx` (the user-tx `execution_status` column is
+     * uniformly "included"). Self-signed (NULL relayer) txns are excluded.
+     */
     private async loadRelayerBreakdownByActivity(last24h: Date, last7d: Date, last30d: Date): Promise<RelayerActivityItem[]> {
         const windows: Array<{ key: "last24h" | "last7d" | "last30d"; gte: Date }> = [
             { key: "last24h", gte: last24h },
@@ -1327,61 +1340,40 @@ export class DashboardDataService {
             { key: "last30d", gte: last30d },
         ];
 
+        type RelayerRow = { relayer_account_id: string; total: string; failed: string; distinct_users: string };
         const results = await Promise.all(
-            windows.flatMap((w) => [
-                this.signEventRepo.query<Array<{ relayer_account_id: string; cnt: string }>>(
-                    `SELECT relayer_account_id, COUNT(*) AS cnt
-                     FROM fastauth_sign_events
-                     WHERE block_timestamp >= $1
-                     GROUP BY relayer_account_id`,
+            windows.map((w) =>
+                this.userTxRepo.query<RelayerRow[]>(
+                    `SELECT u.relayer_account_id AS relayer_account_id,
+                            COUNT(*) AS total,
+                            COUNT(*) FILTER (WHERE h.outcome = 'failure') AS failed,
+                            COUNT(DISTINCT u.signer_account_id) AS distinct_users
+                     FROM fastauth_user_transactions u
+                     LEFT JOIN fastauth_user_health_tx h ON h.tx_hash = u.tx_hash
+                     WHERE u.relayer_account_id IS NOT NULL AND u.block_timestamp >= $1
+                     GROUP BY u.relayer_account_id`,
                     [w.gte],
                 ),
-                this.loadSignFailedByDimension("relayer_account_id", w.gte),
-                this.signEventRepo.query<Array<{ relayer_account_id: string; cnt: string }>>(
-                    `SELECT relayer_account_id, COUNT(*) AS cnt FROM (
-                         SELECT DISTINCT relayer_account_id, user_derived_public_key
-                         FROM fastauth_sign_events
-                         WHERE block_timestamp >= $1 AND user_derived_public_key IS NOT NULL
-                     ) t
-                     GROUP BY relayer_account_id`,
-                    [w.gte],
-                ),
-            ]),
+            ),
         );
 
         const allKeys = new Set<string>();
         const perWindow = new Map<"last24h" | "last7d" | "last30d", Map<string, GuardWindowStats>>();
 
         windows.forEach((w, i) => {
-            const totalRows = results[i * 3] as Array<{ relayer_account_id: string; cnt: string }>;
-            const failedMap = results[i * 3 + 1] as Map<string | null, number>;
-            const distinctRows = results[i * 3 + 2] as Array<{ relayer_account_id: string; cnt: string }>;
-
             const map = new Map<string, GuardWindowStats>();
-            for (const row of totalRows) {
+            for (const row of results[i]) {
                 allKeys.add(row.relayer_account_id);
-                const total = Number(row.cnt);
-                map.set(row.relayer_account_id, { signed: total, failed: 0, total, distinctUsers: 0, successRatePct: null });
-            }
-            for (const [rawKey, count] of failedMap) {
-                if (rawKey === null) continue;
-                const stats = map.get(rawKey);
-                if (stats) {
-                    stats.failed = count;
-                    stats.signed = Math.max(0, stats.total - count);
-                } else {
-                    allKeys.add(rawKey);
-                    map.set(rawKey, { signed: 0, failed: count, total: count, distinctUsers: 0, successRatePct: null });
-                }
-            }
-            for (const row of distinctRows) {
-                const stats = map.get(row.relayer_account_id);
-                if (stats) stats.distinctUsers = Number(row.cnt);
-            }
-            for (const stats of map.values()) {
-                if (stats.total > 0) {
-                    stats.successRatePct = Math.round((stats.signed / stats.total) * 1000) / 10;
-                }
+                const total = Number(row.total);
+                const failed = Number(row.failed);
+                const signed = Math.max(0, total - failed);
+                map.set(row.relayer_account_id, {
+                    signed,
+                    failed,
+                    total,
+                    distinctUsers: Number(row.distinct_users),
+                    successRatePct: total > 0 ? Math.round((signed / total) * 1000) / 10 : null,
+                });
             }
             perWindow.set(w.key, map);
         });

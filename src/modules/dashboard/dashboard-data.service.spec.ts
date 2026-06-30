@@ -38,6 +38,7 @@ describe("DashboardDataService", () => {
     let contractSnapRepo: any;
     let missingRangeRepo: any;
     let nearTxRepo: any;
+    let userTxRepo: any;
 
     beforeEach(async () => {
         signEventRepo = makeRepo();
@@ -45,6 +46,7 @@ describe("DashboardDataService", () => {
         contractSnapRepo = makeRepo();
         missingRangeRepo = makeRepo();
         nearTxRepo = makeRepo();
+        userTxRepo = makeRepo();
 
         const moduleRef: TestingModule = await Test.createTestingModule({
             providers: [
@@ -58,7 +60,7 @@ describe("DashboardDataService", () => {
                 { provide: getRepositoryToken(IndexerCheckpoint), useValue: makeRepo() },
                 { provide: getRepositoryToken(MissingBlockRange), useValue: missingRangeRepo },
                 { provide: getRepositoryToken(FastAuthContractSnapshot), useValue: contractSnapRepo },
-                { provide: getRepositoryToken(FastAuthUserTransaction), useValue: makeRepo() },
+                { provide: getRepositoryToken(FastAuthUserTransaction), useValue: userTxRepo },
                 { provide: getRepositoryToken(FastAuthUserHealthTx), useValue: makeRepo() },
                 { provide: ConfigService, useValue: { get: jest.fn() } },
             ],
@@ -95,6 +97,35 @@ describe("DashboardDataService", () => {
         expect(result.collectorHealth).toHaveLength(2);
         expect(result.collectorHealth[0].source).toBe("near");
         expect(result.collectorHealth[1].source).toBe("fastauth_accounts");
+    });
+
+    it("builds relayerBreakdownByActivity from user transactions grouped by relayer", async () => {
+        // The By-relayer breakdown queries fastauth_user_transactions (joined to
+        // the user-health table for failures), grouped by relayer_account_id.
+        userTxRepo.query.mockImplementation((sql: string) => {
+            if (sql.includes("u.relayer_account_id") && sql.includes("fastauth_user_health_tx")) {
+                return Promise.resolve([
+                    { relayer_account_id: "relayer.nearmobile.near", total: "10", failed: "2", distinct_users: "5" },
+                    { relayer_account_id: "sweat-relayer.near", total: "100", failed: "0", distinct_users: "40" },
+                ]);
+            }
+            return Promise.resolve([]);
+        });
+
+        const result = await service.getDashboardData();
+
+        const rows = result.relayerBreakdownByActivity;
+        // Sorted by last30d.total desc.
+        expect(rows.map((r) => r.relayerAccountId)).toEqual(["sweat-relayer.near", "relayer.nearmobile.near"]);
+        const byId = Object.fromEntries(rows.map((r) => [r.relayerAccountId, r]));
+        expect(byId["relayer.nearmobile.near"].last24h).toMatchObject({
+            total: 10,
+            failed: 2,
+            signed: 8,
+            distinctUsers: 5,
+            successRatePct: 80,
+        });
+        expect(byId["sweat-relayer.near"].last24h).toMatchObject({ total: 100, failed: 0, signed: 100, successRatePct: 100 });
     });
 
     it("computes accountsOverview totals as indexed + migrated", async () => {
