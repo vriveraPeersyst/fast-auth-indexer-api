@@ -103,6 +103,8 @@ describe("NearIngestService", () => {
         }).compile();
 
         service = moduleRef.get(NearIngestService);
+        // Hole-retry back-off waits are instant in tests.
+        jest.spyOn(service as any, "sleep").mockResolvedValue(undefined);
     }
 
     beforeEach(async () => {
@@ -214,12 +216,40 @@ describe("NearIngestService", () => {
 
         const result = await service.runOnce();
 
+        // Retried NEAR_HOLE_RETRY_ROUNDS times, still failing → deferred.
+        // (fetchBlockByHeight always rejects.)
         // Tolerant walk: the failed height is deferred (not a fatal error),
         // the run still reports ok so the scheduler doesn't log it as an error
         // every cycle during normal rate-limit backpressure.
         expect(result.status).toBe("ok");
         expect(result.details).toContain("hard fail");
         expect(result.details).toMatch(/deferred 1 heights/);
+    });
+
+    it("retries an in-run hole so the checkpoint advances the full window (no waste)", async () => {
+        const latestHeight = 200_000_000;
+        // latestHeight itself is served from latestPayload; the hole is the
+        // earlier height fetched via fetchBlockByHeight.
+        nearBlock.fetchFinalBlock.mockResolvedValue({
+            result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
+        });
+        checkpoints.get.mockImplementation((k: string) => {
+            if (k === "near_last_scanned_height") return String(latestHeight - 2);
+            return null;
+        });
+        // First pass: the earlier height 429s (hole). Retry: it succeeds.
+        nearBlock.fetchBlockByHeight.mockRejectedValueOnce(new Error("429 rate limited")).mockResolvedValue({
+            result: { header: { height: latestHeight - 1, hash: "h-1", timestamp: 1_700_000_000_000_000 }, chunks: [] },
+        });
+        nearBlock.isSkippableMissingHeightError.mockReturnValue(false);
+
+        const result = await service.runOnce();
+
+        expect(result.status).toBe("ok");
+        // The hole was retried and resolved, so the checkpoint advances to the
+        // window's target — nothing deferred, nothing to re-fetch next run.
+        expect(result.details).toMatch(/persisted up to height 200000000/);
+        expect(result.details).not.toMatch(/deferred \d+ heights/);
     });
 
     it("rebuilds marts only when sign events were indexed", async () => {
