@@ -36,5 +36,6 @@ import { WipeDbService } from "./wipe-db.service";
         SeedMissingRangesCommand,
         SkipForwardCommand,
     ],
+    exports: [SkipForwardService],
 })
 export class OpsModule {}
