@@ -38,6 +38,17 @@ const NEAR_BLOCK_CONCURRENCY = 10;
 const NEAR_CHUNK_CONCURRENCY = 4;
 const NEAR_BACKFILL_START_HEIGHT = 194_800_000;
 const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
+// Holes — heights that exhausted their RPC retries (usually a 429 on a weak
+// endpoint) — are retried IN-RUN before advancing the checkpoint. The
+// contiguous-advance rule means one unretried hole ~30 blocks into a 500-wide
+// window discards the ~470 blocks processed after it (they are re-fetched next
+// run), so the checkpoint crawls ~30 blocks/run and the indexer diverges from
+// the chain tip. Weak endpoints recover as their 60s blacklist expires and a
+// retry re-picks a healthy one, so a few short rounds let a run advance its
+// full window. Anything still failing after the last round defers to the next
+// run (the original tolerant behavior — no worse than before).
+const NEAR_HOLE_RETRY_ROUNDS = 3;
+const NEAR_HOLE_RETRY_DELAY_MS = 4000;
 // The relayer mart is a full-table re-aggregation of fastauth_sign_events
 // (3 GROUP BYs + DELETE/re-INSERT) whose cost grows with the table. Running it
 // every cycle that persisted events dominates per-run overhead during tip
@@ -196,28 +207,46 @@ export class NearIngestService {
             // recorded and left out of `completedHeights`, so the contiguous
             // checkpoint stops just before the first hole and those heights are
             // retried next run. Everything fetchable still commits this run.
-            const failedHeights: number[] = [];
             let lastHeightError: unknown = null;
-            await runWithConcurrency(heights, NEAR_BLOCK_CONCURRENCY, async (height) => {
-                try {
-                    await this.processBlockHeight({
-                        height,
-                        latestHeight,
-                        latestPayload,
-                        fastAuthContractSet,
-                        batchInlinePubKeys,
-                        probeCache,
-                        tokenRegistry,
-                        stats,
-                        completedHeights,
-                        startedAt,
-                        totalPlanned: heights.length,
-                    });
-                } catch (error) {
-                    failedHeights.push(height);
-                    lastHeightError = error;
-                }
-            });
+            const runHeights = async (batch: number[]): Promise<number[]> => {
+                const failed: number[] = [];
+                await runWithConcurrency(batch, NEAR_BLOCK_CONCURRENCY, async (height) => {
+                    try {
+                        await this.processBlockHeight({
+                            height,
+                            latestHeight,
+                            latestPayload,
+                            fastAuthContractSet,
+                            batchInlinePubKeys,
+                            probeCache,
+                            tokenRegistry,
+                            stats,
+                            completedHeights,
+                            startedAt,
+                            totalPlanned: heights.length,
+                        });
+                    } catch (error) {
+                        failed.push(height);
+                        lastHeightError = error;
+                    }
+                });
+                return failed;
+            };
+
+            let failedHeights = await runHeights(heights);
+            // Retry only the holes, in-run, before advancing the checkpoint —
+            // see NEAR_HOLE_RETRY_ROUNDS. Successful retries land in
+            // `completedHeights`, so the contiguous frontier below advances past
+            // resolved holes instead of discarding everything after the first
+            // one and re-fetching it next run.
+            for (let round = 1; round <= NEAR_HOLE_RETRY_ROUNDS && failedHeights.length > 0; round += 1) {
+                const holesBefore = failedHeights.length;
+                await this.sleep(NEAR_HOLE_RETRY_DELAY_MS);
+                failedHeights = await runHeights(failedHeights);
+                this.logger.log(
+                    `NEAR collector hole-retry round ${round}/${NEAR_HOLE_RETRY_ROUNDS}: retried ${holesBefore}, ${failedHeights.length} still failing`,
+                );
+            }
 
             // Advance checkpoints only to the highest contiguous completed
             // height. Holes (e.g. 429 in the middle of the window) stop the
@@ -274,6 +303,10 @@ export class NearIngestService {
             this.logger.error(`near-ingest run failed: ${message}`);
             return { source: SOURCE, status: "error", details: message };
         }
+    }
+
+    private sleep(ms: number): Promise<void> {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
     private async computeRange(latestHeight: number): Promise<{ startHeight: number; targetHeight: number }> {
