@@ -41,7 +41,12 @@ function uniqueUrls(urls: string[]): string[] {
 }
 
 function isUnknownBlockMessage(message: string): boolean {
-    return message.includes("UNKNOWN_BLOCK") || message.includes("Unknown block") || message.includes("DB Not Found");
+    return (
+        message.includes("UNKNOWN_BLOCK") ||
+        message.includes("Unknown block") ||
+        message.includes("DB Not Found") ||
+        message.includes("UNKNOWN_CHUNK")
+    );
 }
 
 export interface NearRpcServiceOptions {
@@ -165,10 +170,12 @@ export class NearRpcService {
     async request<TResponse>(method: string, params: unknown, contextLabel: string): Promise<TResponse> {
         let lastError: Error | null = null;
         const unknownBlockEndpoints = new Set<string>();
+        const contactedEndpoints = new Set<string>();
         const healthyEndpointCount = this.endpoints.length;
 
         for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
             const endpoint = this.pickNextEndpoint();
+            contactedEndpoints.add(endpoint.url);
             const abortController = new AbortController();
             const timeoutHandle = setTimeout(() => {
                 abortController.abort(`timeout after ${this.requestTimeoutMs}ms`);
@@ -232,6 +239,12 @@ export class NearRpcService {
         }
 
         const baseMessage = lastError?.message ?? `NEAR ${contextLabel} request failed.`;
-        throw new NearRpcExhaustedError(baseMessage, unknownBlockEndpoints, healthyEndpointCount, this.maxAttempts);
+        throw new NearRpcExhaustedError(
+            baseMessage,
+            unknownBlockEndpoints,
+            healthyEndpointCount,
+            this.maxAttempts,
+            contactedEndpoints.size,
+        );
     }
 }
