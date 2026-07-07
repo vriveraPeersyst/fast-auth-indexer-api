@@ -54,6 +54,11 @@ Root cause, established empirically (see `scratchpad/rpc-probe.mjs`,
   a future archival-backed backfill ("recover later"). No data is silently
   dropped.
 - **Free RPC only.** No paid/archival endpoint.
+- **The skip fires automatically on worker boot, behind a strict guard**, so a
+  merge to `main` (which Railway auto-deploys from the `main` repo trigger) is
+  enough to unblock the indexer with no manual step. The `ops:skip-forward`
+  command stays as a manual override. `MAX_BLOCKS_PER_RUN` is left at 500
+  (~2–4h to repopulate the 24h window — acceptable).
 
 ## Goals / Non-goals
 
@@ -123,7 +128,35 @@ Modify `src/modules/ops/skip-forward.service.ts` and its command:
 - Extend `SkipForwardSummary` with `hoursBack`, `lagBlocks`, `skipTarget`.
 
 The command `ops:skip-forward` gains `--hours-back <n>` (default 24), keeps
-`--confirm` (dry-run default).
+`--confirm` (dry-run default). It remains the manual override.
+
+#### A3. Boot-time guarded auto-skip (primary trigger)
+
+A `BootSkipGuardService` implementing `OnApplicationBootstrap` (registered in
+`worker.module.ts`, so it runs in the worker process, not the CLI). On boot,
+once, it decides whether to auto-run the skip:
+
+1. Read `near_last_scanned_height`; fetch latest final block → `latestHeight`.
+2. **Cheap pre-check:** `lag = latestHeight − scannedHeight`. If
+   `lag < SKIP_GUARD_MIN_LAG_BLOCKS` (= 144,000, i.e. < 24h behind) → do
+   nothing (normal operation / already caught up).
+3. **Pruned-everywhere probe:** fetch the block at `scannedHeight + 1`. Only if
+   it is confirmed pruned on *all healthy endpoints contacted* (Phase B1
+   detection) → proceed. A served block means we are behind but can still
+   index normally → do nothing.
+4. If both gates pass, call `SkipForwardService.run(confirm=true,
+   hoursBack=24)` — writes the ledger row and advances checkpoints to
+   `tip − 24h`. Log loudly.
+
+**Why it is safe / self-limiting:** after firing once, `scannedHeight` jumps to
+`tip − 24h`, whose blocks *are* served, so the pruned-everywhere gate fails on
+every subsequent boot; during the ~2–4h catch-up a redeploy re-checks and the
+gate fails (blocks in the 24h→tip window are served). It only ever fires when
+the checkpoint is genuinely stranded past every endpoint's horizon. It must
+complete before the first `near-ingest` cron tick does material work; being an
+`OnApplicationBootstrap` hook it runs during app init, ahead of scheduled
+ticks. It shares no lock with the scheduler but is idempotent w.r.t. the ledger
+(`(start_height,end_height)` unique) and only advances checkpoints forward.
 
 #### A2. Free-RPC pool cleanup
 
@@ -163,13 +196,13 @@ surfaces as `UNKNOWN_CHUNK` on `fetchChunkByHash`. Add an equivalent
 than failing forever. Scope note: within the 24h forward window chunks are
 served, so this mainly protects against future fall-behind.
 
-#### B2. (Optional, can defer) Self-healing auto-skip
+B1's "absent everywhere it was contacted" detection is a dependency of the
+boot-time guard (A3, step 3) — implement it together with, or before, A3.
 
-If a `near-ingest` run finds its `startHeight` pruned everywhere (Phase B1
-"absent everywhere"), auto-invoke the skip-forward logic to `tip − 24h` and
-record the gap, so a future >58h fall-behind self-heals without manual ops.
-Marked optional; Phase A + not falling behind (abundant capacity) is expected
-to suffice. Decide during implementation whether to include.
+The earlier "self-healing auto-skip inside each `near-ingest` run" is **not**
+built: the boot-time guard (A3) covers the same recurrence case more simply
+(one check at startup rather than a branch on the hot path), and a redeploy is
+how this service restarts.
 
 ## Data model
 
@@ -202,17 +235,22 @@ matching existing rows and `SkipForwardService`).
 - `isSkippableMissingHeightError`: block served by one endpoint (others
   DB-Not-Found) → **not** skippable; absent on all contacted → skippable;
   single-endpoint transient → not skippable. `UNKNOWN_CHUNK` classification.
+- `BootSkipGuardService`: fires when lag ≥ 24h **and** `scannedHeight+1` pruned
+  everywhere → runs skip; does **not** fire when lag < 24h; does **not** fire
+  when the block is served (behind but recoverable); does not fire twice
+  (post-skip the block is served).
 
 ## Rollout / operational steps
 
-1. Merge Phase A (A1 + A2). Deploy.
-2. Run the skip once (dry-run first):
-   `pnpm run cli:prod ops:skip-forward --hours-back 24`   (inspect summary)
-   `pnpm run cli:prod ops:skip-forward --hours-back 24 --confirm`
-3. Watch logs: `near-ingest` range should start at `tip − 144,000` and walk
-   forward; lag shrinks to ~0 within hours; dashboard past-24h populates.
-4. Confirm the `missing_block_ranges` row exists (open).
-5. Phase B can ship separately once Phase A is verified.
+1. Merge to `main`. Railway auto-deploys (repo trigger on `main`).
+2. On boot the guard (A3) detects the stranded checkpoint and auto-runs the
+   skip to `tip − 24h`; no manual step. (Manual override available:
+   `pnpm run cli:prod ops:skip-forward --hours-back 24 [--confirm]`.)
+3. Watch logs: a `BootSkipGuard` skip line, then `near-ingest` range starting
+   at `tip − 144,000` and walking forward; lag shrinks to ~0 within ~2–4h;
+   dashboard past-24h populates.
+4. Confirm the `missing_block_ranges` row exists (status `open`) for the
+   `[old checkpoint .. tip−24h]` gap.
 
 ## Risks
 
