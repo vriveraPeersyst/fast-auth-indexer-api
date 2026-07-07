@@ -119,7 +119,9 @@ export class SkipForwardService {
             newScannedHash = block.result?.header?.hash ?? null;
         } catch (err) {
             this.logger.warn(
-                `Could not fetch hash for height ${newScanned}: ${err instanceof Error ? err.message : String(err)}. Clearing stale hash checkpoint.`,
+                `Could not fetch hash for height ${newScanned}: ${
+                    err instanceof Error ? err.message : String(err)
+                }. Clearing stale hash checkpoint.`,
             );
         }
 
@@ -129,9 +131,7 @@ export class SkipForwardService {
             this.checkpoints.set(CHECKPOINT_CHAIN_HEAD_HEIGHT, String(latestHeight)),
             this.checkpoints.set(CHECKPOINT_CHAIN_HEAD_HASH, latestHash),
         ];
-        writes.push(
-            newScannedHash ? this.checkpoints.set(CHECKPOINT_HASH, newScannedHash) : this.checkpoints.delete(CHECKPOINT_HASH),
-        );
+        writes.push(newScannedHash ? this.checkpoints.set(CHECKPOINT_HASH, newScannedHash) : this.checkpoints.delete(CHECKPOINT_HASH));
         await Promise.all(writes);
 
         this.logger.warn(
