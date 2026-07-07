@@ -13,6 +13,7 @@ import { HealthModule } from "./modules/health/health.module";
 import { IndexerSchedulerModule } from "./modules/indexer-scheduler/indexer-scheduler.module";
 import { IndexerTriggerModule } from "./modules/indexer-trigger/indexer-trigger.module";
 import { NearIngestModule } from "./modules/near-ingest/near-ingest.module";
+import { BootSkipGuardService } from "./modules/ops/boot-skip-guard.service";
 import { OpsModule } from "./modules/ops/ops.module";
 import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-key-accounts.module";
 
@@ -50,6 +51,6 @@ import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-ke
         IndexerTriggerModule,
         DashboardModule,
     ],
-    providers: [{ provide: APP_FILTER, useClass: ErrorFilter }],
+    providers: [{ provide: APP_FILTER, useClass: ErrorFilter }, BootSkipGuardService],
 })
 export class WorkerModule {}

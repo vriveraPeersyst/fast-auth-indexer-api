@@ -18,16 +18,16 @@ const DEFAULT_MAX_RPC_FAILURES = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
 const DEFAULT_REQUEST_ID = "fast-auth-indexer-api";
 
-// Hardcoded NEAR RPC pool. Ordered by sustained capacity at c=40 ramp benchmark
-// (2026-04-24), not raw single-call latency. Position 0 handles all traffic
-// until it 429s, then rotates. See migration source `near-rpc-manager.ts` for
-// per-endpoint capacity numbers and the rationale for excluding archival nodes.
+// Hardcoded NEAR RPC pool. Free public endpoints only. Ordered by sustained
+// capacity measured 2026-07-07 (drpc ~119 req/s @ 0% 429, lava ~32, then
+// fastnear/shitzu). Dropped near.blockpi.network (now 402/503 "Apikey not
+// found" — paywalled) and 1rpc.io/near (does not implement the `block` method,
+// -32601); both only fed the blacklist cascade. Non-archival: none serve
+// blocks older than ~20–58h — see the skip-forward guard for the pruning trap.
 export const NEAR_RPC_URLS = [
-    "https://near.blockpi.network/v1/rpc/public",
+    "https://near.drpc.org",
     "https://near.lava.build",
     "https://free.rpc.fastnear.com",
-    "https://near.drpc.org",
-    "https://1rpc.io/near",
     "https://rpc.shitzuapes.xyz",
 ];
 
@@ -41,7 +41,12 @@ function uniqueUrls(urls: string[]): string[] {
 }
 
 function isUnknownBlockMessage(message: string): boolean {
-    return message.includes("UNKNOWN_BLOCK") || message.includes("Unknown block") || message.includes("DB Not Found");
+    return (
+        message.includes("UNKNOWN_BLOCK") ||
+        message.includes("Unknown block") ||
+        message.includes("DB Not Found") ||
+        message.includes("UNKNOWN_CHUNK")
+    );
 }
 
 export interface NearRpcServiceOptions {
@@ -165,10 +170,12 @@ export class NearRpcService {
     async request<TResponse>(method: string, params: unknown, contextLabel: string): Promise<TResponse> {
         let lastError: Error | null = null;
         const unknownBlockEndpoints = new Set<string>();
+        const contactedEndpoints = new Set<string>();
         const healthyEndpointCount = this.endpoints.length;
 
         for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
             const endpoint = this.pickNextEndpoint();
+            contactedEndpoints.add(endpoint.url);
             const abortController = new AbortController();
             const timeoutHandle = setTimeout(() => {
                 abortController.abort(`timeout after ${this.requestTimeoutMs}ms`);
@@ -232,6 +239,12 @@ export class NearRpcService {
         }
 
         const baseMessage = lastError?.message ?? `NEAR ${contextLabel} request failed.`;
-        throw new NearRpcExhaustedError(baseMessage, unknownBlockEndpoints, healthyEndpointCount, this.maxAttempts);
+        throw new NearRpcExhaustedError(
+            baseMessage,
+            unknownBlockEndpoints,
+            healthyEndpointCount,
+            this.maxAttempts,
+            contactedEndpoints.size,
+        );
     }
 }
