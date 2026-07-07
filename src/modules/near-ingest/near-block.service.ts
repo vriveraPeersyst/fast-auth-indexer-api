@@ -26,10 +26,10 @@ export type NearChunkResponse = {
 /**
  * Wraps `NearRpcService` with the three NEAR RPC verbs the ingest collector
  * needs: latest-final block, block-by-height, chunk-by-hash. Also exposes the
- * "is this height permanently absent?" classifier — it requires majority
- * consensus across the public RPC pool before agreeing the height is gone,
- * preventing a single pruning RPC from advancing the checkpoint past real
- * blocks.
+ * "is this height permanently absent?" classifier — it requires every
+ * endpoint actually contacted to agree the height is gone (with a 2-endpoint
+ * floor), preventing a single pruning RPC — or one endpoint's shorter
+ * retention horizon — from advancing the checkpoint past real blocks.
  */
 @Injectable()
 export class NearBlockService {
@@ -54,16 +54,22 @@ export class NearBlockService {
      *     transient single-call failure).
      *   - The error message to mention `block-by-height` (we don't apply this
      *     classification to chunk lookups or other RPC verbs).
-     *   - At least ceil(healthyEndpointCount / 2) distinct endpoints to have
-     *     responded with UNKNOWN_BLOCK before agreeing the height is absent.
+     *   - Every endpoint we actually contacted to have reported the block
+     *     missing (a contacted endpoint that failed for another reason, e.g.
+     *     a 429, means the block may still exist there), with at least two
+     *     endpoints agreeing (a single-endpoint transient must not advance
+     *     the checkpoint).
      *
-     * Without the quorum check, a single pruning RPC could lie about heights
-     * it doesn't serve and cause the checkpoint to advance past real blocks.
+     * Endpoints have heterogeneous pruning horizons (e.g. lava ~58h vs
+     * fastnear ~20h), so a quorum across the whole pool would wrongly skip
+     * blocks that a longer-retention endpoint still serves. Requiring
+     * unanimous agreement among only the endpoints actually reached avoids
+     * that false positive while still catching genuinely pruned heights.
      */
     isSkippableMissingHeightError(error: unknown): boolean {
         if (!(error instanceof NearRpcExhaustedError)) return false;
         if (!error.message.includes("block-by-height")) return false;
-        const quorum = Math.ceil(error.healthyEndpointCount / 2);
-        return error.unknownBlockEndpoints.size >= quorum;
+        const missing = error.unknownBlockEndpoints.size;
+        return missing >= 2 && missing >= error.contactedEndpointCount;
     }
 }

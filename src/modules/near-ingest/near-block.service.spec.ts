@@ -36,25 +36,31 @@ describe("NearBlockService", () => {
     });
 
     describe("isSkippableMissingHeightError", () => {
+        // ctor: (message, unknownBlockEndpoints, healthyEndpointCount, totalAttempts, contactedEndpointCount)
         it("returns false for non-NearRpcExhaustedError errors", () => {
             expect(service.isSkippableMissingHeightError(new Error("plain"))).toBe(false);
             expect(service.isSkippableMissingHeightError(null)).toBe(false);
         });
 
-        it("returns false when error message doesn't mention block-by-height", () => {
-            const err = new NearRpcExhaustedError("chunk-by-hash failed", new Set(["a", "b"]), 4, 8);
+        it("returns false when the error is not for a block-by-height call", () => {
+            const err = new NearRpcExhaustedError("chunk-by-hash failed", new Set(["a", "b"]), 4, 8, 2);
             expect(service.isSkippableMissingHeightError(err)).toBe(false);
         });
 
-        it("returns false when fewer than majority endpoints reported UNKNOWN_BLOCK", () => {
-            const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a"]), 4, 8);
-            // quorum = ceil(4/2) = 2, only 1 reported → not enough
-            expect(service.isSkippableMissingHeightError(err)).toBe(false);
-        });
-
-        it("returns true when majority of endpoints reported UNKNOWN_BLOCK for block-by-height", () => {
-            const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a", "b", "c"]), 4, 8);
+        it("returns true when every contacted endpoint reported the block missing (>=2)", () => {
+            const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a", "b", "c"]), 4, 8, 3);
             expect(service.isSkippableMissingHeightError(err)).toBe(true);
+        });
+
+        it("returns false when a contacted endpoint failed for another reason (429) — block may exist there", () => {
+            // 3 said missing, but 4 endpoints were contacted (one 429'd, not a missing-signal)
+            const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a", "b", "c"]), 4, 8, 4);
+            expect(service.isSkippableMissingHeightError(err)).toBe(false);
+        });
+
+        it("returns false when only one endpoint reported missing (below the 2-agreement floor)", () => {
+            const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a"]), 4, 8, 1);
+            expect(service.isSkippableMissingHeightError(err)).toBe(false);
         });
     });
 });
