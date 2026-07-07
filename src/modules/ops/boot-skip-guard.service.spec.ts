@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { Test, TestingModule } from "@nestjs/testing";
 
 import { BootSkipGuardService } from "./boot-skip-guard.service";
@@ -16,12 +17,15 @@ describe("BootSkipGuardService", () => {
     });
 
     it("invokes autoSkipIfStranded(24) on bootstrap", async () => {
-        await guard.onApplicationBootstrap();
+        await guard.onModuleInit();
         expect(skipForward.autoSkipIfStranded).toHaveBeenCalledWith(24);
     });
 
     it("never throws even if the skip check fails", async () => {
+        const errorSpy = jest.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
         skipForward.autoSkipIfStranded.mockRejectedValue(new Error("rpc down"));
-        await expect(guard.onApplicationBootstrap()).resolves.toBeUndefined();
+        await expect(guard.onModuleInit()).resolves.toBeUndefined();
+        expect(errorSpy).toHaveBeenCalled();
+        errorSpy.mockRestore();
     });
 });

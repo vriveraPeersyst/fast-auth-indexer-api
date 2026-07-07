@@ -52,6 +52,11 @@ describe("NearBlockService", () => {
             expect(service.isSkippableMissingHeightError(err)).toBe(true);
         });
 
+        it("returns true at the exact 2-endpoint floor (both contacted agree missing)", () => {
+            const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a", "b"]), 4, 8, 2);
+            expect(service.isSkippableMissingHeightError(err)).toBe(true);
+        });
+
         it("returns false when a contacted endpoint failed for another reason (429) — block may exist there", () => {
             // 3 said missing, but 4 endpoints were contacted (one 429'd, not a missing-signal)
             const err = new NearRpcExhaustedError("block-by-height 100 failed", new Set(["a", "b", "c"]), 4, 8, 4);
