@@ -7,6 +7,7 @@ import { TypeOrmModule } from "@nestjs/typeorm";
 import configuration from "./config/configuration";
 import { ErrorFilter } from "./modules/common/exception/error.filter";
 import { DashboardModule } from "./modules/dashboard/dashboard.module";
+import { DashboardSnapshotModule } from "./modules/dashboard/dashboard-snapshot.module";
 import { FastauthContractStateModule } from "./modules/fastauth-contract-state/fastauth-contract-state.module";
 import { HealthApiModule } from "./modules/health-api/health-api.module";
 import { HealthModule } from "./modules/health/health.module";
@@ -50,6 +51,8 @@ import { PublicKeyAccountsModule } from "./modules/public-key-accounts/public-ke
         HealthApiModule,
         IndexerTriggerModule,
         DashboardModule,
+        // Worker-only: 5-minute dashboard-snapshot precompute cron.
+        DashboardSnapshotModule,
     ],
     providers: [{ provide: APP_FILTER, useClass: ErrorFilter }, BootSkipGuardService],
 })

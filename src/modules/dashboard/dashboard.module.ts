@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
 
 import { Account } from "../../database/entities/Account";
+import { DashboardSnapshot } from "../../database/entities/DashboardSnapshot";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -21,6 +22,7 @@ import { MetricsService } from "./metrics.service";
     imports: [
         TypeOrmModule.forFeature([
             Account,
+            DashboardSnapshot,
             FastAuthContractSnapshot,
             FastAuthHealthTx,
             FastAuthPublicKeyAccount,
@@ -35,5 +37,8 @@ import { MetricsService } from "./metrics.service";
     ],
     providers: [DashboardService, MetricsService, DashboardDataService],
     controllers: [DashboardController],
+    // Exported so the worker-only DashboardSnapshotModule can drive the same
+    // singleton compute methods from its 5-minute cron.
+    exports: [DashboardDataService, MetricsService],
 })
 export class DashboardModule {}

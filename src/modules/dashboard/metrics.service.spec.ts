@@ -2,6 +2,7 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { getRepositoryToken } from "@nestjs/typeorm";
 
 import { Account } from "../../database/entities/Account";
+import { DashboardSnapshot } from "../../database/entities/DashboardSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { Relayer } from "../../database/entities/Relayer";
@@ -14,6 +15,7 @@ describe("MetricsService", () => {
     let signEventRepo: { query: jest.Mock };
     let relayerRepo: { count: jest.Mock };
     let healthRepo: { query: jest.Mock };
+    let snapshotRepo: { findOne: jest.Mock };
 
     beforeEach(async () => {
         accountRepo = {
@@ -22,6 +24,9 @@ describe("MetricsService", () => {
         signEventRepo = { query: jest.fn().mockResolvedValue([{ last_7d: "0", last_30d: "0" }]) };
         relayerRepo = { count: jest.fn().mockResolvedValue(0) };
         healthRepo = { query: jest.fn().mockResolvedValue([{ ok_24h: "0", failed_24h: "0" }]) };
+        // Default: no precomputed snapshot row yet → getMetrics falls back to
+        // computeMetrics(), which the compute-path tests below exercise.
+        snapshotRepo = { findOne: jest.fn().mockResolvedValue(null) };
 
         const moduleRef: TestingModule = await Test.createTestingModule({
             providers: [
@@ -30,10 +35,31 @@ describe("MetricsService", () => {
                 { provide: getRepositoryToken(FastAuthSignEvent), useValue: signEventRepo },
                 { provide: getRepositoryToken(Relayer), useValue: relayerRepo },
                 { provide: getRepositoryToken(FastAuthHealthTx), useValue: healthRepo },
+                { provide: getRepositoryToken(DashboardSnapshot), useValue: snapshotRepo },
             ],
         }).compile();
 
         service = moduleRef.get(MetricsService);
+    });
+
+    it("serves the stored metrics snapshot without recomputing when a row exists", async () => {
+        const stored = {
+            fetchedAt: "2026-07-08T00:00:00.000Z",
+            accounts: { total: 42, indexed: 40, migrated: 2, new24h: 1, active24h: 3, active7d: 5, active30d: 7 },
+            signEvents: { last7d: 9, last30d: 11 },
+            relayers: { total: 4 },
+            health24h: { uptimePct: 99.5, classified: 200, successful: 199, failed: 1 },
+        };
+        snapshotRepo.findOne.mockResolvedValue({ key: "metrics", payloadJson: stored, computedAt: new Date() });
+
+        const result = await service.getMetrics();
+
+        expect(result).toEqual(stored);
+        // The whole point: no on-demand aggregation on the request path.
+        expect(accountRepo.query).not.toHaveBeenCalled();
+        expect(signEventRepo.query).not.toHaveBeenCalled();
+        expect(relayerRepo.count).not.toHaveBeenCalled();
+        expect(healthRepo.query).not.toHaveBeenCalled();
     });
 
     it("returns the full metrics shape with derived totals and uptime %", async () => {
