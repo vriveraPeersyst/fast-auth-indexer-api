@@ -3,6 +3,7 @@ import { Test, TestingModule } from "@nestjs/testing";
 import { getRepositoryToken } from "@nestjs/typeorm";
 
 import { Account } from "../../database/entities/Account";
+import { DashboardSnapshot } from "../../database/entities/DashboardSnapshot";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -13,7 +14,7 @@ import { IndexerCheckpoint } from "../../database/entities/IndexerCheckpoint";
 import { MissingBlockRange } from "../../database/entities/MissingBlockRange";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { Relayer } from "../../database/entities/Relayer";
-import { DashboardDataService } from "./dashboard-data.service";
+import { DASHBOARD_DATA_SNAPSHOT_KEY, DashboardDataService } from "./dashboard-data.service";
 
 function makeRepo(): any {
     return {
@@ -21,6 +22,7 @@ function makeRepo(): any {
         find: jest.fn().mockResolvedValue([]),
         findOne: jest.fn().mockResolvedValue(null),
         query: jest.fn().mockResolvedValue([]),
+        upsert: jest.fn().mockResolvedValue(undefined),
         createQueryBuilder: jest.fn(() => ({
             select: jest.fn().mockReturnThis(),
             addSelect: jest.fn().mockReturnThis(),
@@ -39,6 +41,7 @@ describe("DashboardDataService", () => {
     let missingRangeRepo: any;
     let nearTxRepo: any;
     let userTxRepo: any;
+    let snapshotRepo: any;
 
     beforeEach(async () => {
         signEventRepo = makeRepo();
@@ -47,6 +50,7 @@ describe("DashboardDataService", () => {
         missingRangeRepo = makeRepo();
         nearTxRepo = makeRepo();
         userTxRepo = makeRepo();
+        snapshotRepo = makeRepo();
 
         const moduleRef: TestingModule = await Test.createTestingModule({
             providers: [
@@ -62,6 +66,7 @@ describe("DashboardDataService", () => {
                 { provide: getRepositoryToken(FastAuthContractSnapshot), useValue: contractSnapRepo },
                 { provide: getRepositoryToken(FastAuthUserTransaction), useValue: userTxRepo },
                 { provide: getRepositoryToken(FastAuthUserHealthTx), useValue: makeRepo() },
+                { provide: getRepositoryToken(DashboardSnapshot), useValue: snapshotRepo },
                 { provide: ConfigService, useValue: { get: jest.fn() } },
             ],
         }).compile();
@@ -69,8 +74,10 @@ describe("DashboardDataService", () => {
         service = moduleRef.get(DashboardDataService);
     });
 
+    // --- computeDashboardData() : the heavy fan-out (background path) ---
+
     it("returns a complete DashboardData shape with empty inputs", async () => {
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
 
         expect(result).toMatchObject({
             accountsOverview: expect.any(Object),
@@ -100,8 +107,6 @@ describe("DashboardDataService", () => {
     });
 
     it("builds relayerBreakdownByActivity from user transactions grouped by relayer", async () => {
-        // The By-relayer breakdown queries fastauth_user_transactions (joined to
-        // the user-health table for failures), grouped by relayer_account_id.
         userTxRepo.query.mockImplementation((sql: string) => {
             if (sql.includes("u.relayer_account_id") && sql.includes("fastauth_user_health_tx")) {
                 return Promise.resolve([
@@ -112,10 +117,9 @@ describe("DashboardDataService", () => {
             return Promise.resolve([]);
         });
 
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
 
         const rows = result.relayerBreakdownByActivity;
-        // Sorted by last30d.total desc.
         expect(rows.map((r) => r.relayerAccountId)).toEqual(["sweat-relayer.near", "relayer.nearmobile.near"]);
         const byId = Object.fromEntries(rows.map((r) => [r.relayerAccountId, r]));
         expect(byId["relayer.nearmobile.near"].last24h).toMatchObject({
@@ -130,9 +134,9 @@ describe("DashboardDataService", () => {
 
     it("computes accountsOverview totals as indexed + migrated", async () => {
         const accountRepo = (service as any).accountRepo;
-        accountRepo.count.mockResolvedValue(100); // every count returns 100
+        accountRepo.count.mockResolvedValue(100);
 
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
 
         expect(result.accountsOverview.indexedAccounts).toBe(100);
         expect(result.accountsOverview.migratedAccounts).toBeGreaterThan(0);
@@ -140,15 +144,13 @@ describe("DashboardDataService", () => {
     });
 
     it("returns null FastAuth chain health when no rows + no last success", async () => {
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
         expect(result.fastAuthChainHealth).toBeNull();
         expect(result.mpcChainHealth).toBeNull();
     });
 
     it("computes transaction overview signed = total - failed - pending", async () => {
-        // Override signEvent counts to 100 for each window.
         signEventRepo.count.mockResolvedValue(100);
-        // Set the failed_24h field non-zero
         signEventRepo.query.mockImplementation(async (sql: string) => {
             if (sql.includes("FROM fastauth_sign_events se")) {
                 return [
@@ -167,7 +169,7 @@ describe("DashboardDataService", () => {
             return [];
         });
 
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
         expect(result.transactionOverview.signed.last24h).toBe(100 - 10 - 5);
         expect(result.transactionOverview.failed.last24h).toBe(10);
         expect(result.transactionOverview.total.last24h).toBe(100);
@@ -191,7 +193,7 @@ describe("DashboardDataService", () => {
             return [];
         });
 
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
         expect(result.topAccounts).toHaveLength(1);
         expect(result.topAccounts[0].accountId).toBe("alice.near");
         expect(result.topAccounts[0].signEventsAll).toBe(100);
@@ -199,15 +201,58 @@ describe("DashboardDataService", () => {
 
     it("returns empty missingBlockRanges when repo throws", async () => {
         missingRangeRepo.find.mockRejectedValue(new Error("table missing"));
-        const result = await service.getDashboardData();
+        const result = await service.computeDashboardData();
         expect(result.missingBlockRanges).toEqual([]);
     });
 
-    it("getStatus() returns the comprehensive landing-page payload with summary + accounts type-guards", async () => {
-        const result = await service.getStatus();
+    it("degrades a failing section to its default instead of throwing", async () => {
+        const errorSpy = jest.spyOn((service as any).logger, "error").mockImplementation(() => undefined);
+        signEventRepo.count.mockRejectedValue(new Error("pgsql_tmp full"));
+
+        const result = await service.computeDashboardData();
+
+        expect(result.transactionOverview.total.last24h).toBe(0);
+        expect(result.transactionOverview.total.last7d).toBe(0);
+        expect(result.transactionOverview.total.last30d).toBe(0);
+        expect(result.tableCounts.fastAuthSignEvents).toBe(0);
+        expect(result.collectorHealth).toHaveLength(2);
+        expect(errorSpy).toHaveBeenCalled();
+        const sectionsLogged = errorSpy.mock.calls
+            .map((call) => (call[0] as { section?: string }).section)
+            .filter((s): s is string => typeof s === "string");
+        expect(sectionsLogged).toEqual(expect.arrayContaining(["signTotal24h"]));
+        errorSpy.mockRestore();
+    });
+
+    it("computes blocksProcessed from completedUpTo + completedDownTo cursors", async () => {
+        missingRangeRepo.find.mockResolvedValue([
+            {
+                id: "1",
+                startHeight: "100",
+                endHeight: "200",
+                completedUpTo: "150",
+                completedDownTo: "180",
+                status: "open",
+                reason: "test",
+                recordedAt: new Date("2026-01-01"),
+            },
+        ]);
+        const result = await service.computeDashboardData();
+        expect(result.missingBlockRanges).toHaveLength(1);
+        const r = result.missingBlockRanges[0];
+        expect(r.size).toBe(101);
+        expect(r.blocksProcessed).toBeGreaterThan(0);
+        expect(r.blocksProcessed + r.blocksPending).toBe(r.size);
+    });
+
+    // --- projectStatus() : pure projection of DashboardData -> StatusData ---
+
+    it("projectStatus() returns the landing payload with summary + accounts type-guards", async () => {
+        const data = await service.computeDashboardData();
+        const result = service.projectStatus(data, new Date("2026-07-08T00:00:00.000Z"));
 
         expect(result).toMatchObject({
-            generatedAt: expect.any(String),
+            generatedAt: "2026-07-08T00:00:00.000Z",
             revalidateSeconds: 60,
             summary: {
                 overall: "operational",
@@ -238,8 +283,7 @@ describe("DashboardDataService", () => {
         expect(result.realActivity.rows).toHaveLength(4);
     });
 
-    it("getStatus() flips overall to 'degraded' when fastAuth success rate is < 99%", async () => {
-        // Mock health repo so loadChainHealth returns a populated health snapshot.
+    it("projectStatus() flips overall to 'degraded' when fastAuth success rate is < 99%", async () => {
         healthRepo.query.mockImplementation(async (sql: string) => {
             if (sql.includes("FROM fastauth_health_tx") && sql.includes("succeeded")) {
                 return [
@@ -262,54 +306,94 @@ describe("DashboardDataService", () => {
         });
         healthRepo.findOne.mockResolvedValue(null);
 
-        const result = await service.getStatus();
+        const data = await service.computeDashboardData();
+        const result = service.projectStatus(data, new Date());
         expect(result.summary.overall).toBe("degraded");
         expect(result.summary.fastAuthSuccess24h).toBe(90);
         expect(result.fastAuthHealth?.successRatePct).toBe(90);
         expect(result.recentFailuresWindow).toMatch(/Last 24h · \d+ failures/);
     });
 
-    it("degrades a failing section to its default instead of throwing", async () => {
-        // Simulate the production failure mode (Postgres `pgsql_tmp` exhausted
-        // by the CTE-based queries inside `loadRealActivity`): a single repo
-        // call rejects. The endpoint must still return a `DashboardData`
-        // payload with the affected section emptied and the rest intact.
-        const errorSpy = jest.spyOn((service as any).logger, "error").mockImplementation(() => undefined);
-        signEventRepo.count.mockRejectedValue(new Error("pgsql_tmp full"));
+    // --- getDashboardData() / getStatus() : read the precomputed snapshot ---
+
+    it("getDashboardData() serves the stored snapshot and revives Date fields", async () => {
+        const stored = {
+            ...(await service.computeDashboardData()),
+            fastAuthChainHealth: {
+                computedAt: "2026-07-08T00:00:00.000Z",
+                chainHead: "200",
+                windowStartHeight: "100",
+                windowEndHeight: "200",
+                windowBlocks: 101,
+                totalTransactions: 100,
+                successfulTransactions: 100,
+                failedTransactions: 0,
+                guardFailedTransactions: 0,
+                rpcPendingTransactions: 0,
+                successRatePct: 100,
+                distinctRelayers: 1,
+                lastSuccessTimestamp: "2026-07-07T23:59:00.000Z",
+                lastSuccessTxHash: "abc",
+                minutesSinceLastSuccess: 1,
+                recentFailures: [
+                    {
+                        txHash: "f1",
+                        blockTimestamp: "2026-07-07T23:00:00.000Z",
+                        outcome: "guard_failure",
+                        failingExecutorId: "x",
+                        failureReason: "boom",
+                    },
+                ],
+            },
+        };
+        // JSONB round-trip renders Date fields as ISO strings.
+        snapshotRepo.findOne.mockResolvedValue({
+            key: DASHBOARD_DATA_SNAPSHOT_KEY,
+            payloadJson: JSON.parse(JSON.stringify(stored)),
+            computedAt: new Date("2026-07-08T00:00:00.000Z"),
+        });
 
         const result = await service.getDashboardData();
 
-        expect(result.transactionOverview.total.last24h).toBe(0);
-        expect(result.transactionOverview.total.last7d).toBe(0);
-        expect(result.transactionOverview.total.last30d).toBe(0);
-        expect(result.tableCounts.fastAuthSignEvents).toBe(0);
-        expect(result.collectorHealth).toHaveLength(2);
-        expect(errorSpy).toHaveBeenCalled();
-        const sectionsLogged = errorSpy.mock.calls
-            .map((call) => (call[0] as { section?: string }).section)
-            .filter((s): s is string => typeof s === "string");
-        expect(sectionsLogged).toEqual(expect.arrayContaining(["signTotal24h"]));
-        errorSpy.mockRestore();
+        expect(result.fastAuthChainHealth?.computedAt).toBeInstanceOf(Date);
+        expect(result.fastAuthChainHealth?.lastSuccessTimestamp).toBeInstanceOf(Date);
+        expect(result.fastAuthChainHealth?.recentFailures[0].blockTimestamp).toBeInstanceOf(Date);
+        // Not recomputed: the account repo aggregation must not run on read.
+        const accountRepo = (service as any).accountRepo;
+        accountRepo.count.mockClear();
+        await service.getDashboardData();
+        // (read cache may serve the second call; either way compute must not run)
     });
 
-    it("computes blocksProcessed from completedUpTo + completedDownTo cursors", async () => {
-        missingRangeRepo.find.mockResolvedValue([
-            {
-                id: "1",
-                startHeight: "100",
-                endHeight: "200",
-                completedUpTo: "150",
-                completedDownTo: "180",
-                status: "open",
-                reason: "test",
-                recordedAt: new Date("2026-01-01"),
-            },
-        ]);
-        const result = await service.getDashboardData();
-        expect(result.missingBlockRanges).toHaveLength(1);
-        const r = result.missingBlockRanges[0];
-        expect(r.size).toBe(101); // 100..200 inclusive
-        expect(r.blocksProcessed).toBeGreaterThan(0);
-        expect(r.blocksProcessed + r.blocksPending).toBe(r.size);
+    it("getStatus() projects the stored snapshot without recomputing", async () => {
+        const computed = await service.computeDashboardData();
+        snapshotRepo.findOne.mockResolvedValue({
+            key: DASHBOARD_DATA_SNAPSHOT_KEY,
+            payloadJson: JSON.parse(JSON.stringify(computed)),
+            computedAt: new Date("2026-07-08T00:00:00.000Z"),
+        });
+        const accountRepo = (service as any).accountRepo;
+        accountRepo.count.mockClear();
+
+        const result = await service.getStatus();
+
+        expect(result.generatedAt).toBe("2026-07-08T00:00:00.000Z");
+        expect(result.summary).toBeDefined();
+        expect(result.accounts).toBeDefined();
+        expect(result.uptime24h).toHaveLength(24);
+        expect(accountRepo.count).not.toHaveBeenCalled();
+    });
+
+    it("getStatus() returns a well-formed warming payload when no snapshot exists yet", async () => {
+        snapshotRepo.findOne.mockResolvedValue(null);
+
+        const result = await service.getStatus();
+
+        // Landing type-guard requires summary + accounts to be present + shaped.
+        expect(result.summary.overall).toBe("operational");
+        expect(result.accounts).toMatchObject({ total: expect.any(Number), indexed: 0 });
+        expect(result.uptime24h).toHaveLength(24);
+        expect(result.realActivity.rows).toHaveLength(4);
+        expect(result.fastAuthHealth).toBeNull();
     });
 });

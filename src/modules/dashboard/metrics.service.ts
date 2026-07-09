@@ -3,13 +3,20 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
 
 import { Account } from "../../database/entities/Account";
+import { DashboardSnapshot } from "../../database/entities/DashboardSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { Relayer } from "../../database/entities/Relayer";
 import { TtlMemo } from "../common/ttl-memo";
 import { MIGRATED_ACCOUNTS_TOTAL } from "./migrated-accounts.constant";
 
-const METRICS_TTL_MS = 30_000;
+/** Snapshot row key under which the precompute job stores the metrics payload. */
+export const METRICS_SNAPSHOT_KEY = "metrics";
+
+// Short read-side cache in front of the single-row snapshot lookup. The
+// snapshot itself only changes every ~5 min (cron), so this just collapses
+// request bursts to one SELECT; it is NOT the freshness bound.
+const METRICS_READ_TTL_MS = 10_000;
 
 export type MetricsPayload = {
     fetchedAt: string;
@@ -37,26 +44,39 @@ export type MetricsPayload = {
  * per-account or per-tx detail. Same shape as the dashboard repo's old
  * `/api/public/metrics` route. Cache headers (60s TTL) are applied at the
  * controller layer.
+ *
+ * The request path (`getMetrics`) reads a precomputed row from
+ * `dashboard_snapshots` written every ~5 min by the snapshot cron, so it does
+ * zero on-demand aggregation. `computeMetrics` (the heavy path) is retained and
+ * called only by that background job; it also serves as a cold-start fallback
+ * until the first snapshot lands.
  */
 @Injectable()
 export class MetricsService {
-    // 30s single-flight memo. Landing-page metrics are pure aggregates and
-    // already advertise Cache-Control: max-age=60 — a 30s in-process cache is
-    // strictly fresher and removes near-100% of DB roundtrips at any RPS.
-    private readonly memo = new TtlMemo<MetricsPayload>(METRICS_TTL_MS);
+    // Short read cache in front of the snapshot SELECT (see const comment).
+    private readonly readMemo = new TtlMemo<MetricsPayload>(METRICS_READ_TTL_MS);
 
     constructor(
         @InjectRepository(Account) private readonly accountRepo: Repository<Account>,
         @InjectRepository(FastAuthSignEvent) private readonly signEventRepo: Repository<FastAuthSignEvent>,
         @InjectRepository(Relayer) private readonly relayerRepo: Repository<Relayer>,
         @InjectRepository(FastAuthHealthTx) private readonly healthRepo: Repository<FastAuthHealthTx>,
+        @InjectRepository(DashboardSnapshot) private readonly snapshotRepo: Repository<DashboardSnapshot>,
     ) {}
 
+    /** Request path: serve the precomputed snapshot (O(1)); compute only as a cold-start fallback. */
     async getMetrics(): Promise<MetricsPayload> {
-        return this.memo.get(() => this.computeMetrics());
+        return this.readMemo.get(async () => {
+            const row = await this.snapshotRepo.findOne({ where: { key: METRICS_SNAPSHOT_KEY } });
+            // MetricsPayload is all primitives + an ISO string (`fetchedAt`), so
+            // it needs no Date revival — the stored JSON is directly usable.
+            if (row) return row.payloadJson as MetricsPayload;
+            return this.computeMetrics();
+        });
     }
 
-    private async computeMetrics(): Promise<MetricsPayload> {
+    /** Heavy aggregation path. Called by the snapshot cron (and cold-start fallback). */
+    async computeMetrics(): Promise<MetricsPayload> {
         const now = new Date();
         const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
         const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);

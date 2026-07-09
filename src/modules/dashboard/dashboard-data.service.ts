@@ -4,6 +4,7 @@ import { InjectRepository } from "@nestjs/typeorm";
 import { In, MoreThanOrEqual, Repository } from "typeorm";
 
 import { Account } from "../../database/entities/Account";
+import { DashboardSnapshot } from "../../database/entities/DashboardSnapshot";
 import { FastAuthContractSnapshot } from "../../database/entities/FastAuthContractSnapshot";
 import { FastAuthHealthTx } from "../../database/entities/FastAuthHealthTx";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
@@ -45,7 +46,13 @@ import { TtlMemo } from "../common/ttl-memo";
 import { MIGRATED_ACCOUNTS_TOTAL } from "./migrated-accounts.constant";
 import { StatusData, StatusFailureDto, StatusUptimeBucket } from "./status.types";
 
-const DASHBOARD_DATA_TTL_MS = 30_000;
+/** Snapshot row key under which the precompute job stores the DashboardData payload. */
+export const DASHBOARD_DATA_SNAPSHOT_KEY = "dashboard_data";
+
+// Short read-side cache in front of the single-row snapshot lookup. The
+// snapshot only changes every ~5 min (cron), so this just collapses request
+// bursts to one SELECT; it is NOT the data-freshness bound.
+const DASHBOARD_READ_TTL_MS = 10_000;
 
 const MAX_RELAYER_ROWS = 30;
 const MAX_UNIQUE_SPONSORED_ACCOUNTS_TO_DISPLAY = 12;
@@ -190,6 +197,132 @@ function getCollectorHealthStatus(
     return { status: "stale", ageMinutes };
 }
 
+type SnapshotRead = { data: DashboardData; computedAt: Date | null };
+
+function reviveDate(value: unknown): Date | null {
+    return value == null ? null : new Date(value as string);
+}
+
+/**
+ * Revive the `Date`-typed fields of a `DashboardData` that the JSONB round-trip
+ * flattened to ISO strings. Only the fields downstream code consumes as real
+ * `Date`s (via `.toISOString()` / `.getTime()` in `projectStatus` and
+ * `build24hBuckets`) need reviving; the rest are already in final form.
+ */
+function reviveDashboardData(raw: unknown): DashboardData {
+    const data = raw as DashboardData;
+
+    const fa = data.fastAuthChainHealth;
+    if (fa) {
+        fa.computedAt = new Date(fa.computedAt as unknown as string);
+        fa.lastSuccessTimestamp = reviveDate(fa.lastSuccessTimestamp);
+        fa.recentFailures = fa.recentFailures.map((f) => ({ ...f, blockTimestamp: new Date(f.blockTimestamp as unknown as string) }));
+    }
+
+    const mpc = data.mpcChainHealth;
+    if (mpc) {
+        mpc.computedAt = new Date(mpc.computedAt as unknown as string);
+        mpc.recentFailures = mpc.recentFailures.map((f) => ({ ...f, blockTimestamp: new Date(f.blockTimestamp as unknown as string) }));
+    }
+
+    data.chainHealthHistory = data.chainHealthHistory.map((p) => ({ ...p, computedAt: new Date(p.computedAt as unknown as string) }));
+
+    const tracking = data.realActivity?.trackingStartedAt;
+    if (tracking) {
+        tracking.blockTimestamp = new Date(tracking.blockTimestamp as unknown as string);
+    }
+
+    if (data.fastAuthContracts) {
+        data.fastAuthContracts.contracts = data.fastAuthContracts.contracts.map((c) => ({
+            ...c,
+            snapshotAt: new Date(c.snapshotAt as unknown as string),
+        }));
+        data.fastAuthContracts.earliestSnapshotAt = reviveDate(data.fastAuthContracts.earliestSnapshotAt);
+    }
+
+    if (data.indexerLag) {
+        data.indexerLag.latestIndexedBlockTimestamp = reviveDate(data.indexerLag.latestIndexedBlockTimestamp);
+        data.indexerLag.lastScannedCheckpointAt = reviveDate(data.indexerLag.lastScannedCheckpointAt);
+    }
+
+    return data;
+}
+
+/**
+ * Well-formed empty payload served before the first snapshot lands (first-ever
+ * boot, no row yet). Preserves the `DashboardData` contract so the FastAuth
+ * landing type-guard (`summary` + `accounts`) still passes; the migrated-account
+ * constant is shown even while cold since it is a static figure.
+ */
+function emptyDashboardData(): DashboardData {
+    const zeros = { last24h: 0, last7d: 0, last30d: 0, all: 0 };
+    const totalAccounts = MIGRATED_ACCOUNTS_TOTAL;
+    return {
+        accountsOverview: {
+            totalAccounts,
+            indexedAccounts: 0,
+            migratedAccounts: MIGRATED_ACCOUNTS_TOTAL,
+            firstSeen: { last24h: 0, last7d: 0, last30d: 0, all: totalAccounts },
+            active: { last24h: 0, last7d: 0, last30d: 0, all: totalAccounts },
+        },
+        transactionOverview: { signed: { ...zeros }, failed: { ...zeros }, total: { ...zeros } },
+        providerBreakdown: [],
+        relayerBreakdownByActivity: [],
+        guardBreakdown: [],
+        actionTypeBreakdown: [],
+        realActivity: emptyRealActivity(),
+        topAccounts: [],
+        latestNearFinalBlock: null,
+        indexerLag: {
+            chainHead: null,
+            scannedHeight: null,
+            backfillStartHeight: null,
+            blocksBehind: null,
+            latestIndexedBlockTimestamp: null,
+            minutesBehind: null,
+            lastScannedCheckpointAt: null,
+        },
+        fastAuthChainHealth: null,
+        mpcChainHealth: null,
+        chainHealthHistory: [],
+        missingBlockRanges: [],
+        collectorHealth: [
+            {
+                source: "near",
+                displayName: "NEAR",
+                status: "no_data",
+                ageMinutes: null,
+                lastWriteAt: null,
+                checkpoint: null,
+                details: "Final-block scan progress (including skipped empty heights).",
+            },
+            {
+                source: "fastauth_accounts",
+                displayName: "FastAuth Accounts",
+                status: "no_data",
+                ageMinutes: null,
+                lastWriteAt: null,
+                checkpoint: null,
+                details: "Links derived public keys to NEAR accounts via FastNEAR.",
+            },
+        ],
+        relayerBreakdown: [],
+        recentNearTransactions: [],
+        recentSignEvents: [],
+        topPublicKeyAccounts: [],
+        indexerCheckpoints: [],
+        tableCounts: {
+            nearTransactions: 0,
+            fastAuthSignEvents: 0,
+            accounts: 0,
+            publicKeyAccounts: 0,
+            relayers: 0,
+            indexerCheckpoints: 0,
+        },
+        fastAuthContracts: emptyFastAuthContracts(),
+    };
+}
+
 /**
  * Comprehensive read-side aggregator. Mirrors the dashboard repo's
  * `getDashboardData()` shape so the hosted frontend can swap data sources
@@ -214,11 +347,11 @@ function getCollectorHealthStatus(
 export class DashboardDataService {
     private readonly logger = new Logger(DashboardDataService.name);
 
-    // 30s single-flight memo. /public/dashboard-data fans out into ~80
-    // queries; under any concurrent traffic this collapses repeat hits to a
-    // single fan-out per window. /public/status is just a projection of
-    // getDashboardData(), so it inherits the same cache for free.
-    private readonly dashboardMemo = new TtlMemo<DashboardData>(DASHBOARD_DATA_TTL_MS);
+    // Short single-flight read cache in front of the snapshot SELECT. The heavy
+    // fan-out no longer runs on the request path — it runs once per ~5 min in
+    // DashboardSnapshotService and lands in `dashboard_snapshots`; this memo
+    // just collapses request bursts to one row read.
+    private readonly readMemo = new TtlMemo<SnapshotRead>(DASHBOARD_READ_TTL_MS);
 
     constructor(
         @InjectRepository(Account) private readonly accountRepo: Repository<Account>,
@@ -236,14 +369,34 @@ export class DashboardDataService {
         private readonly userTxRepo: Repository<FastAuthUserTransaction>,
         @InjectRepository(FastAuthUserHealthTx)
         private readonly userHealthRepo: Repository<FastAuthUserHealthTx>,
+        @InjectRepository(DashboardSnapshot)
+        private readonly snapshotRepo: Repository<DashboardSnapshot>,
         private readonly config: ConfigService,
     ) {}
 
+    /**
+     * Request path: return the precomputed snapshot (O(1) row read + revive).
+     * Falls back to a well-formed warming default only before the first
+     * snapshot lands. The heavy `computeDashboardData()` fan-out is NOT invoked
+     * here — it runs exclusively in the background snapshot job.
+     */
     async getDashboardData(): Promise<DashboardData> {
-        return this.dashboardMemo.get(() => this.computeDashboardData());
+        return (await this.readSnapshot()).data;
     }
 
-    private async computeDashboardData(): Promise<DashboardData> {
+    private async readSnapshot(): Promise<SnapshotRead> {
+        return this.readMemo.get(async () => {
+            const row = await this.snapshotRepo.findOne({ where: { key: DASHBOARD_DATA_SNAPSHOT_KEY } });
+            if (!row) return { data: emptyDashboardData(), computedAt: null };
+            return { data: reviveDashboardData(row.payloadJson), computedAt: row.computedAt };
+        });
+    }
+
+    /**
+     * Heavy read-side fan-out (~60 queries). Called only by the background
+     * snapshot job (DashboardSnapshotService) — never on the request path.
+     */
+    async computeDashboardData(): Promise<DashboardData> {
         const now = new Date();
         const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
         const last7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
@@ -523,13 +676,21 @@ export class DashboardDataService {
     }
 
     /**
-     * Public status payload — read-only projection of getDashboardData() into
-     * the same JSON contract the original dashboard repo exposed at
-     * `/api/public/status`. Consumed by the FastAuth landing page's /status
-     * route, which type-guards on `summary` + `accounts`.
+     * Request path for `/public/status`: read the precomputed snapshot and
+     * project it into the landing-page contract. No aggregation runs here.
      */
     async getStatus(): Promise<StatusData> {
-        const data = await this.getDashboardData();
+        const { data, computedAt } = await this.readSnapshot();
+        return this.projectStatus(data, computedAt);
+    }
+
+    /**
+     * Pure projection of a `DashboardData` into the `/api/public/status` JSON
+     * contract consumed by the FastAuth landing page's /status route (which
+     * type-guards on `summary` + `accounts`). `computedAt` is the snapshot's
+     * compute time, surfaced as `generatedAt` so consumers see true freshness.
+     */
+    projectStatus(data: DashboardData, computedAt: Date | null): StatusData {
         const fa = data.fastAuthChainHealth;
         const mpc = data.mpcChainHealth;
 
@@ -549,7 +710,7 @@ export class DashboardDataService {
         }));
 
         return {
-            generatedAt: new Date().toISOString(),
+            generatedAt: (computedAt ?? new Date()).toISOString(),
             revalidateSeconds: 60,
             summary: {
                 overall,
