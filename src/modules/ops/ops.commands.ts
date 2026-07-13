@@ -77,7 +77,7 @@ export class SkipForwardCommand {
     async run(
         @Option({ name: "confirm", describe: "Required to actually advance checkpoints", type: "boolean", default: false })
         confirm: boolean,
-        @Option({ name: "hours-back", describe: "Skip to this many hours before chain tip", type: "number", default: 24 })
+        @Option({ name: "hours-back", describe: "Skip to this many hours before chain tip", type: "number", default: 12 })
         hoursBack: number,
     ): Promise<void> {
         const summary = await this.service.run(confirm, hoursBack);
