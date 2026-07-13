@@ -12,8 +12,17 @@ const CHECKPOINT_SCANNED_HEIGHT = "near_last_scanned_height";
 const CHECKPOINT_CHAIN_HEAD_HEIGHT = "near_chain_head_height";
 const CHECKPOINT_CHAIN_HEAD_HASH = "near_chain_head_hash";
 
-const NEAR_BLOCK_TIME_SECONDS = 0.6;
-const DEFAULT_SKIP_HOURS_BACK = 24;
+const NEAR_BLOCK_TIME_SECONDS = 0.61;
+// Skip target. 12h keeps the scanned head safely inside the <20h band where all
+// four RPC endpoints still serve the blocks (fastnear/shitzu prune at ~20h), so
+// catch-up runs stall-free. 24h sat *inside* the pruned band where only
+// drpc/lava serve, which oscillated and never converged.
+const DEFAULT_SKIP_HOURS_BACK = 12;
+// Above this lag the checkpoint is in/near the pruned band and cannot catch up
+// on the free pool — the boot guard force-resets to tip-DEFAULT_SKIP_HOURS_BACK
+// even if drpc/lava still serve the next block. Must exceed the skip target so
+// a healthy indexer running a few hours behind is left alone.
+const DEFAULT_MAX_LAG_HOURS = 18;
 
 export type SkipForwardSummary = {
     currentScannedHeight: number;
@@ -147,7 +156,10 @@ export class SkipForwardService {
      * (a served block means we're behind but can still index normally). Returns
      * the skip summary if it fired, else null.
      */
-    async autoSkipIfStranded(hoursBack: number = DEFAULT_SKIP_HOURS_BACK): Promise<SkipForwardSummary | null> {
+    async autoSkipIfStranded(
+        hoursBack: number = DEFAULT_SKIP_HOURS_BACK,
+        maxLagHours: number = DEFAULT_MAX_LAG_HOURS,
+    ): Promise<SkipForwardSummary | null> {
         const scannedRaw = await this.checkpoints.get(CHECKPOINT_SCANNED_HEIGHT);
         const currentScannedHeight = scannedRaw ? Number(scannedRaw) : null;
         if (currentScannedHeight === null || !Number.isFinite(currentScannedHeight)) return null;
@@ -156,21 +168,32 @@ export class SkipForwardService {
         const latestHeight = latestFinal.result?.header?.height;
         if (!latestHeight) return null;
 
+        const lag = latestHeight - currentScannedHeight;
         const lagBlocks = Math.round((hoursBack * 3600) / NEAR_BLOCK_TIME_SECONDS);
-        if (latestHeight - currentScannedHeight < lagBlocks) return null;
+        if (lag < lagBlocks) return null; // within the target window — healthy, nothing to do
 
-        const probeHeight = currentScannedHeight + 1;
-        try {
-            await this.nearBlock.fetchBlockByHeight(probeHeight);
-            return null; // served → recoverable, don't skip
-        } catch (err) {
-            if (!this.nearBlock.isSkippableMissingHeightError(err)) return null; // ambiguous → don't skip
+        // Beyond maxLagHours the checkpoint is in/near the pruned band and can't
+        // catch up on the free pool — force a reset even if drpc/lava still
+        // serve the next block, so we run in the well-served <20h zone instead
+        // of oscillating in place. Between hoursBack and maxLagHours we only
+        // reset if the block is genuinely gone everywhere (the original
+        // stranded case), giving a servable backlog a chance to recover.
+        const maxLagBlocks = Math.round((maxLagHours * 3600) / NEAR_BLOCK_TIME_SECONDS);
+        const forceReset = lag >= maxLagBlocks;
+
+        if (!forceReset) {
+            const probeHeight = currentScannedHeight + 1;
+            try {
+                await this.nearBlock.fetchBlockByHeight(probeHeight);
+                return null; // served and within the recoverable band → keep indexing forward
+            } catch (err) {
+                if (!this.nearBlock.isSkippableMissingHeightError(err)) return null; // ambiguous → don't skip
+            }
         }
 
         this.logger.warn(
-            `Boot guard: checkpoint ${currentScannedHeight} stranded (height ${probeHeight} pruned on all endpoints, lag ${
-                latestHeight - currentScannedHeight
-            }). Auto-skipping to tip-${hoursBack}h.`,
+            `Boot guard: checkpoint ${currentScannedHeight} is ${lag} blocks behind ` +
+                `(${forceReset ? "beyond the free-RPC recoverable band" : "pruned on all endpoints"}). Resetting to tip-${hoursBack}h.`,
         );
         return this.run(true, hoursBack);
     }

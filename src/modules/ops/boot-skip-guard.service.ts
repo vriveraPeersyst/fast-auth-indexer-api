@@ -2,7 +2,7 @@ import { Injectable, Logger, OnModuleInit } from "@nestjs/common";
 
 import { SkipForwardService } from "./skip-forward.service";
 
-const SKIP_GUARD_HOURS_BACK = 24;
+const SKIP_GUARD_HOURS_BACK = 12;
 
 /**
  * If the indexer checkpoint is stranded past the free RPC pool's pruning

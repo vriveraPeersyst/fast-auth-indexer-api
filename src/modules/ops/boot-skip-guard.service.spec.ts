@@ -16,9 +16,9 @@ describe("BootSkipGuardService", () => {
         guard = moduleRef.get(BootSkipGuardService);
     });
 
-    it("invokes autoSkipIfStranded(24) on bootstrap", async () => {
+    it("invokes autoSkipIfStranded(12) on bootstrap", async () => {
         await guard.onModuleInit();
-        expect(skipForward.autoSkipIfStranded).toHaveBeenCalledWith(24);
+        expect(skipForward.autoSkipIfStranded).toHaveBeenCalledWith(12);
     });
 
     it("never throws even if the skip check fails", async () => {
