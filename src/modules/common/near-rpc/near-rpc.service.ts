@@ -6,6 +6,9 @@ type RpcEndpoint = {
     failures: number;
     lastFailure?: number;
     isBlacklisted: boolean;
+    // Static capacity weight and the running SWRR score (see pickNextEndpoint).
+    weight: number;
+    currentWeight: number;
 };
 
 const DEFAULT_RETRY_COUNT = 3;
@@ -31,6 +34,20 @@ export const NEAR_RPC_URLS = [
     "https://rpc.shitzuapes.xyz",
 ];
 
+// Capacity weights (measured 2026-07-07). drpc sustains ~119 req/s @ 0% 429 and
+// retains ~35h; lava ~32 req/s and retains ~58h (the deepest). fastnear/shitzu
+// 429 at very low concurrency AND prune earliest (~20h), so they are weighted
+// down hard — most traffic goes to drpc/lava, and crucially in the 20–58h band
+// where fastnear/shitzu no longer serve the block at all, we stop wasting
+// attempts (and forming holes) on them. Blacklisted endpoints are already
+// excluded by getAvailableEndpoints, so weights only bias the healthy set.
+export const NEAR_RPC_WEIGHTS: Record<string, number> = {
+    "https://near.drpc.org": 8,
+    "https://near.lava.build": 5,
+    "https://free.rpc.fastnear.com": 1,
+    "https://rpc.shitzuapes.xyz": 1,
+};
+
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -51,6 +68,7 @@ function isUnknownBlockMessage(message: string): boolean {
 
 export interface NearRpcServiceOptions {
     urls?: string[];
+    weights?: Record<string, number>;
     maxFailures?: number;
     blacklistDurationMs?: number;
     maxAttempts?: number;
@@ -63,7 +81,6 @@ export interface NearRpcServiceOptions {
 @Injectable()
 export class NearRpcService {
     private readonly endpoints: RpcEndpoint[];
-    private currentIndex = 0;
     private readonly maxFailures: number;
     private readonly blacklistDurationMs: number;
     private readonly maxAttempts: number;
@@ -74,7 +91,14 @@ export class NearRpcService {
 
     constructor(@Optional() options?: NearRpcServiceOptions) {
         const urls = options?.urls ?? NEAR_RPC_URLS;
-        this.endpoints = uniqueUrls(urls).map((url) => ({ url, failures: 0, isBlacklisted: false }));
+        const weights = options?.weights ?? NEAR_RPC_WEIGHTS;
+        this.endpoints = uniqueUrls(urls).map((url) => ({
+            url,
+            failures: 0,
+            isBlacklisted: false,
+            weight: weights[url] ?? 1,
+            currentWeight: 0,
+        }));
 
         if (this.endpoints.length === 0) {
             throw new Error("NearRpcService requires at least one RPC endpoint.");
@@ -106,8 +130,8 @@ export class NearRpcService {
             endpoint.failures = 0;
             endpoint.isBlacklisted = false;
             endpoint.lastFailure = undefined;
+            endpoint.currentWeight = 0;
         }
-        this.currentIndex = 0;
     }
 
     private getAvailableEndpoints(): RpcEndpoint[] {
@@ -118,14 +142,24 @@ export class NearRpcService {
         return this.endpoints;
     }
 
-    // Round-robin: advance `currentIndex` on every call so concurrent callers
-    // entering this method sequentially get distinct endpoints. JS is
-    // single-threaded so the increment is effectively atomic.
+    // Smooth weighted round-robin (nginx's algorithm): add each available
+    // endpoint's weight to its running score, pick the highest, then subtract
+    // the total weight from the winner. Picks are distributed proportionally to
+    // weight but interleaved (not bursty), so drpc/lava carry most traffic
+    // without ever starving the weaker endpoints. Each call is synchronous, so
+    // the shared `currentWeight` mutation is atomic under JS's single thread.
     private pickNextEndpoint(): RpcEndpoint {
         const available = this.getAvailableEndpoints();
-        const idx = this.currentIndex % available.length;
-        this.currentIndex = (this.currentIndex + 1) % available.length;
-        return available[idx];
+        let totalWeight = 0;
+        let best: RpcEndpoint | null = null;
+        for (const endpoint of available) {
+            endpoint.currentWeight += endpoint.weight;
+            totalWeight += endpoint.weight;
+            if (best === null || endpoint.currentWeight > best.currentWeight) best = endpoint;
+        }
+        const picked = best ?? available[0];
+        picked.currentWeight -= totalWeight;
+        return picked;
     }
 
     private isRateLimit(status: number, message: string): boolean {
