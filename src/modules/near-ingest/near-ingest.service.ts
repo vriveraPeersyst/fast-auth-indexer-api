@@ -29,13 +29,15 @@ const SOURCE = "near";
 // been collapsed into source constants because they are deployment-invariant.
 // Change them in code, not via env vars.
 const NEAR_MAX_BLOCKS_PER_RUN = 500;
-// Tuned for free public NEAR RPC endpoints, which 429 under bursty load. Peak
-// concurrent RPC calls ≈ NEAR_BLOCK_CONCURRENCY × NEAR_CHUNK_CONCURRENCY, so
-// these are kept modest to stay under per-endpoint rate limits. If 429s still
-// dominate the logs, lower them further; if the pool gains capacity (more/
-// authenticated endpoints), they can go back up to catch up faster.
-const NEAR_BLOCK_CONCURRENCY = 10;
-const NEAR_CHUNK_CONCURRENCY = 4;
+// Peak concurrent RPC calls ≈ NEAR_BLOCK_CONCURRENCY × NEAR_CHUNK_CONCURRENCY.
+// Raised from 10×4 now that NearRpcService routes by capacity weight (drpc/lava
+// take the bulk, fastnear/shitzu are deprioritised) and in-run hole-retry
+// salvages any 429 that slips through — so more parallelism buys throughput to
+// out-run the chain and pull the scanned head back into the well-served <20h
+// band, instead of just generating holes. If 429s dominate again, lower these
+// or raise drpc/lava's weights.
+const NEAR_BLOCK_CONCURRENCY = 16;
+const NEAR_CHUNK_CONCURRENCY = 6;
 const NEAR_BACKFILL_START_HEIGHT = 194_800_000;
 const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
 // Holes — heights that exhausted their RPC retries (usually a 429 on a weak
