@@ -5,6 +5,7 @@ import { getRepositoryToken } from "@nestjs/typeorm";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
+import { MissingBlockRange } from "../../database/entities/MissingBlockRange";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { CheckpointsService } from "../common/checkpoints/checkpoints.service";
 import { NearRpcExhaustedError } from "../common/near-rpc/near-rpc-exhausted.error";
@@ -36,6 +37,7 @@ describe("NearIngestService", () => {
     let signEventRepo: any;
     let userTxRepo: any;
     let pkaRepo: any;
+    let missingRangeRepo: any;
     let checkpoints: { get: jest.Mock; set: jest.Mock; setMany: jest.Mock };
     let nearBlock: {
         fetchFinalBlock: jest.Mock;
@@ -67,6 +69,10 @@ describe("NearIngestService", () => {
             createQueryBuilder: jest.fn(() => makeSelectQbMock([])),
             query: jest.fn().mockResolvedValue([]),
         };
+        missingRangeRepo = {
+            findOne: jest.fn().mockResolvedValue(null),
+            insert: jest.fn().mockResolvedValue({ identifiers: [{ id: "1" }] }),
+        };
         checkpoints = {
             get: jest.fn().mockResolvedValue(null),
             set: jest.fn().mockResolvedValue(undefined),
@@ -91,6 +97,7 @@ describe("NearIngestService", () => {
                 { provide: getRepositoryToken(FastAuthSignEvent), useValue: signEventRepo },
                 { provide: getRepositoryToken(FastAuthUserTransaction), useValue: userTxRepo },
                 { provide: getRepositoryToken(FastAuthPublicKeyAccount), useValue: pkaRepo },
+                { provide: getRepositoryToken(MissingBlockRange), useValue: missingRangeRepo },
                 { provide: CheckpointsService, useValue: checkpoints },
                 { provide: NearBlockService, useValue: nearBlock },
                 { provide: PricingService, useValue: pricing },
@@ -250,6 +257,49 @@ describe("NearIngestService", () => {
         // window's target — nothing deferred, nothing to re-fetch next run.
         expect(result.details).toMatch(/persisted up to height 200000000/);
         expect(result.details).not.toMatch(/deferred \d+ heights/);
+    });
+
+    it("skips a wedged frontier height (unfetchable on all endpoints), ledgers it, and advances past it", async () => {
+        const latestHeight = 200_000_000;
+        // window [L-2, L-1, L]; L is served from latestPayload.
+        nearBlock.fetchFinalBlock.mockResolvedValue({
+            result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
+        });
+        checkpoints.get.mockImplementation((k: string) => {
+            if (k === "near_last_scanned_height") return String(latestHeight - 3);
+            return null;
+        });
+        // The frontier height L-2 fails every fetch (a wedge); L-1 fetches fine.
+        nearBlock.fetchBlockByHeight.mockImplementation((h: number) => {
+            if (h === latestHeight - 2) return Promise.reject(new Error("UNKNOWN_CHUNK wedge"));
+            return Promise.resolve({
+                result: { header: { height: h, hash: "h" + h, timestamp: 1_700_000_000_000_000 }, chunks: [] },
+            });
+        });
+        nearBlock.isSkippableMissingHeightError.mockReturnValue(false);
+
+        // Run 1: the frontier fails but is only deferred (a single stuck run
+        // could be a transient 429), so nothing is skipped yet.
+        const first = await service.runOnce();
+        expect(first.status).toBe("ok");
+        expect(missingRangeRepo.insert).not.toHaveBeenCalled();
+        expect(first.details).toMatch(/deferred 1 heights/);
+
+        // Run 2: the SAME frontier is still stuck → skip it past the wedge.
+        const second = await service.runOnce();
+
+        expect(second.status).toBe("ok");
+        // The wedged frontier height was ledgered as a 1-block missing range...
+        expect(missingRangeRepo.insert).toHaveBeenCalledTimes(1);
+        expect(missingRangeRepo.insert).toHaveBeenCalledWith(
+            expect.objectContaining({
+                startHeight: String(latestHeight - 2),
+                endHeight: String(latestHeight - 2),
+                status: "open",
+            }),
+        );
+        // ...and the checkpoint advanced past it to the window end (not wedged at 0).
+        expect(second.details).toMatch(/persisted up to height 200000000/);
     });
 
     it("rebuilds marts only when sign events were indexed", async () => {

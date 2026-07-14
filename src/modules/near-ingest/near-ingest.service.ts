@@ -6,6 +6,7 @@ import { Repository } from "typeorm";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
+import { MissingBlockRange } from "../../database/entities/MissingBlockRange";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { CheckpointsService } from "../common/checkpoints/checkpoints.service";
 import { runWithConcurrency, runWithConcurrencyAbortOnError } from "../common/concurrency";
@@ -51,6 +52,11 @@ const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
 // run (the original tolerant behavior — no worse than before).
 const NEAR_HOLE_RETRY_ROUNDS = 3;
 const NEAR_HOLE_RETRY_DELAY_MS = 4000;
+// A frontier height that keeps failing after this many consecutive runs (all
+// its in-run retries exhausted each time) is treated as genuinely unfetchable
+// and skipped past (ledgered), so one pruned/broken block can't wedge the
+// checkpoint forever. A single transient run still just defers to the next run.
+const NEAR_WEDGE_SKIP_AFTER_RUNS = 2;
 // The relayer mart is a full-table re-aggregation of fastauth_sign_events
 // (3 GROUP BYs + DELETE/re-INSERT) whose cost grows with the table. Running it
 // every cycle that persisted events dominates per-run overhead during tip
@@ -117,12 +123,17 @@ export class NearIngestService {
     // the next cycle with events, which is harmless.
     private lastMartRebuildAtMs = 0;
     private martDirty = false;
+    // Wedge-detection state: the frontier height that made zero contiguous
+    // progress last run, and how many consecutive runs it has been stuck.
+    private wedgeFrontier = -1;
+    private wedgeStuckRuns = 0;
 
     constructor(
         @InjectRepository(NearTransaction) private readonly nearTxRepository: Repository<NearTransaction>,
         @InjectRepository(FastAuthSignEvent) private readonly signEventRepository: Repository<FastAuthSignEvent>,
         @InjectRepository(FastAuthUserTransaction) private readonly userTxRepository: Repository<FastAuthUserTransaction>,
         @InjectRepository(FastAuthPublicKeyAccount) private readonly pkaRepository: Repository<FastAuthPublicKeyAccount>,
+        @InjectRepository(MissingBlockRange) private readonly missingRangeRepository: Repository<MissingBlockRange>,
         private readonly checkpoints: CheckpointsService,
         private readonly nearBlock: NearBlockService,
         private readonly pricing: PricingService,
@@ -258,6 +269,55 @@ export class NearIngestService {
                 if (!completedHeights.has(h)) break;
                 highestContiguous = h;
             }
+
+            // Unblock a wedged frontier. When a run makes ZERO contiguous progress
+            // the frontier height (startHeight) is failing every retry — usually a
+            // transient 429, which the next run's retries clear (deferred, as
+            // before). But a block/chunk that no endpoint can serve (e.g.
+            // UNKNOWN_CHUNK pruning) fails run after run and wedges the checkpoint
+            // forever. So only once the SAME frontier has been stuck for
+            // NEAR_WEDGE_SKIP_AFTER_RUNS consecutive runs do we skip the leading
+            // run of still-failing heights: record them as a missing range for
+            // archival backfill and advance past them.
+            if (highestContiguous >= startHeight) {
+                this.wedgeFrontier = -1;
+                this.wedgeStuckRuns = 0;
+            } else if (failedHeights.length > 0) {
+                if (this.wedgeFrontier === startHeight) this.wedgeStuckRuns += 1;
+                else {
+                    this.wedgeFrontier = startHeight;
+                    this.wedgeStuckRuns = 1;
+                }
+
+                if (this.wedgeStuckRuns >= NEAR_WEDGE_SKIP_AFTER_RUNS) {
+                    const failed = new Set(failedHeights);
+                    let wedgeEnd = startHeight - 1;
+                    for (let h = startHeight; h <= targetHeight; h += 1) {
+                        if (!failed.has(h)) break;
+                        wedgeEnd = h;
+                    }
+                    if (wedgeEnd >= startHeight) {
+                        await this.recordSkippedRange(
+                            startHeight,
+                            wedgeEnd,
+                            "wedged frontier: block/chunk unfetchable on all endpoints across multiple runs (likely UNKNOWN_CHUNK pruning). Requires archival-backed backfill.",
+                        );
+                        for (let h = startHeight; h <= wedgeEnd; h += 1) completedHeights.add(h);
+                        failedHeights = failedHeights.filter((h) => h > wedgeEnd);
+                        for (let h = startHeight; h <= targetHeight; h += 1) {
+                            if (!completedHeights.has(h)) break;
+                            highestContiguous = h;
+                        }
+                        this.logger.warn(
+                            `NEAR collector: skipped wedged frontier heights ${startHeight}..${wedgeEnd} after ` +
+                                `${this.wedgeStuckRuns} stuck runs (unfetchable, ledgered); advancing past the wedge.`,
+                        );
+                        this.wedgeFrontier = -1;
+                        this.wedgeStuckRuns = 0;
+                    }
+                }
+            }
+
             if (highestContiguous >= startHeight) {
                 await this.persistRunCheckpoints(highestContiguous, stats);
             }
@@ -726,6 +786,16 @@ export class NearIngestService {
     private async bulkInsert<T>(repo: Repository<T>, rows: any[]): Promise<number> {
         const result = await repo.createQueryBuilder().insert().values(rows).orIgnore().execute();
         return result.identifiers?.length ?? rows.length;
+    }
+
+    /** Record an unindexed height range in `missing_block_ranges` for later
+     * archival-backed backfill. Idempotent on the (start,end) unique index. */
+    private async recordSkippedRange(startHeight: number, endHeight: number, reason: string): Promise<void> {
+        const s = String(startHeight);
+        const e = String(endHeight);
+        const existing = await this.missingRangeRepository.findOne({ where: { startHeight: s, endHeight: e } });
+        if (existing) return;
+        await this.missingRangeRepository.insert({ startHeight: s, endHeight: e, reason, status: "open", recordedAt: new Date() });
     }
 
     private async persistRunCheckpoints(
