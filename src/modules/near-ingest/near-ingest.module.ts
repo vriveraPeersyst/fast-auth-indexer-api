@@ -4,6 +4,7 @@ import { TypeOrmModule } from "@nestjs/typeorm";
 import { FastAuthPublicKeyAccount } from "../../database/entities/FastAuthPublicKeyAccount";
 import { FastAuthSignEvent } from "../../database/entities/FastAuthSignEvent";
 import { FastAuthUserTransaction } from "../../database/entities/FastAuthUserTransaction";
+import { MissingBlockRange } from "../../database/entities/MissingBlockRange";
 import { NearTransaction } from "../../database/entities/NearTransaction";
 import { Relayer } from "../../database/entities/Relayer";
 import { CheckpointsModule } from "../common/checkpoints/checkpoints.module";
@@ -16,7 +17,14 @@ import { RelayerMartsService } from "./relayer-marts.service";
 
 @Module({
     imports: [
-        TypeOrmModule.forFeature([NearTransaction, FastAuthSignEvent, FastAuthUserTransaction, FastAuthPublicKeyAccount, Relayer]),
+        TypeOrmModule.forFeature([
+            NearTransaction,
+            FastAuthSignEvent,
+            FastAuthUserTransaction,
+            FastAuthPublicKeyAccount,
+            MissingBlockRange,
+            Relayer,
+        ]),
         NearRpcModule,
         CheckpointsModule,
         PricingModule,
