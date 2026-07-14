@@ -34,7 +34,7 @@ function poolExtra(): Record<string, unknown> {
     };
     const statementTimeoutMs = num(process.env.DB_STATEMENT_TIMEOUT_MS, 60_000);
     return {
-        max: num(process.env.DB_POOL_MAX, 15),
+        max: num(process.env.DB_POOL_MAX, 24),
         statement_timeout: statementTimeoutMs,
         query_timeout: statementTimeoutMs,
         idleTimeoutMillis: num(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30_000),
