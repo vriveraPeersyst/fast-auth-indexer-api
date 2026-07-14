@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 
+import { CheckpointsModule } from "../common/checkpoints/checkpoints.module";
 import { FastauthContractStateModule } from "../fastauth-contract-state/fastauth-contract-state.module";
 import { HealthModule } from "../health/health.module";
 import { NearIngestModule } from "../near-ingest/near-ingest.module";
@@ -7,7 +8,7 @@ import { PublicKeyAccountsModule } from "../public-key-accounts/public-key-accou
 import { IndexerSchedulerService } from "./indexer-scheduler.service";
 
 @Module({
-    imports: [FastauthContractStateModule, HealthModule, NearIngestModule, PublicKeyAccountsModule],
+    imports: [CheckpointsModule, FastauthContractStateModule, HealthModule, NearIngestModule, PublicKeyAccountsModule],
     providers: [IndexerSchedulerService],
 })
 export class IndexerSchedulerModule {}

@@ -1,6 +1,7 @@
 import { Injectable, Logger } from "@nestjs/common";
 import { Cron } from "@nestjs/schedule";
 
+import { CheckpointsService } from "../common/checkpoints/checkpoints.service";
 import { IndexerRunResult } from "../common/indexer-run-result";
 import { FastauthContractStateService } from "../fastauth-contract-state/fastauth-contract-state.service";
 import { FastauthHealthService } from "../health/fastauth-health.service";
@@ -11,6 +12,17 @@ import { PublicKeyAccountsService } from "../public-key-accounts/public-key-acco
 type Task = "near-ingest" | "health-fastauth" | "health-user" | "pka" | "contract-state";
 
 const MAX_INFLIGHT_TASKS = 4;
+
+// While the indexer is more than this many blocks behind the tip, pause the
+// enrichment/monitoring tasks (pka pubkey resolution, health probes,
+// contract-state) so near-ingest gets the full DB connection pool and event
+// loop for catch-up. pka in particular fans out ~24 concurrent fastNEAR REST
+// lookups that 429 en masse and contend for CPU/sockets/connections. The tasks
+// resume automatically once the lag drops back under the threshold (~30 min of
+// blocks at chain rate). near-ingest itself is never gated.
+const CATCHUP_GATE_LAG_BLOCKS = 3000;
+const CHECKPOINT_CHAIN_HEAD_HEIGHT = "near_chain_head_height";
+const CHECKPOINT_SCANNED_HEIGHT = "near_last_scanned_height";
 
 @Injectable()
 export class IndexerSchedulerService {
@@ -24,6 +36,7 @@ export class IndexerSchedulerService {
         private readonly userHealth: UserHealthService,
         private readonly pka: PublicKeyAccountsService,
         private readonly contractState: FastauthContractStateService,
+        private readonly checkpoints: CheckpointsService,
     ) {}
 
     // Cadences kept tight so near-ingest runs near-continuously: at 30s the
@@ -40,22 +53,43 @@ export class IndexerSchedulerService {
 
     @Cron("5,35 * * * * *", { name: "health-fastauth" })
     async tickFastauthHealth(): Promise<void> {
-        await this.runWithLock("health-fastauth", () => this.fastauthHealth.runOnce());
+        await this.runSiblingUnlessCatchingUp("health-fastauth", () => this.fastauthHealth.runOnce());
     }
 
     @Cron("15,45 * * * * *", { name: "health-user" })
     async tickUserHealth(): Promise<void> {
-        await this.runWithLock("health-user", () => this.userHealth.runOnce());
+        await this.runSiblingUnlessCatchingUp("health-user", () => this.userHealth.runOnce());
     }
 
     @Cron("25 * * * * *", { name: "pka" })
     async tickPka(): Promise<void> {
-        await this.runWithLock("pka", () => this.pka.runOnce());
+        await this.runSiblingUnlessCatchingUp("pka", () => this.pka.runOnce());
     }
 
     @Cron("0 */5 * * * *", { name: "contract-state" })
     async tickContractState(): Promise<void> {
-        await this.runWithLock("contract-state", () => this.contractState.runOnce());
+        await this.runSiblingUnlessCatchingUp("contract-state", () => this.contractState.runOnce());
+    }
+
+    /** True when the indexer is far enough behind that enrichment/monitoring
+     * tasks should stand aside and leave the resources to near-ingest. */
+    private async isCatchingUp(): Promise<boolean> {
+        const [head, scanned] = await Promise.all([
+            this.checkpoints.getNumber(CHECKPOINT_CHAIN_HEAD_HEIGHT),
+            this.checkpoints.getNumber(CHECKPOINT_SCANNED_HEIGHT),
+        ]);
+        if (head === null || scanned === null) return false;
+        return head - scanned > CATCHUP_GATE_LAG_BLOCKS;
+    }
+
+    /** Run a non-ingest task only when the indexer is caught up; otherwise
+     * defer it so near-ingest keeps the DB pool and event loop to itself. */
+    private async runSiblingUnlessCatchingUp(task: Task, fn: () => Promise<IndexerRunResult>): Promise<IndexerRunResult | null> {
+        if (await this.isCatchingUp()) {
+            this.logger.log(`${task} deferred: indexer catching up (lag > ${CATCHUP_GATE_LAG_BLOCKS} blocks)`);
+            return null;
+        }
+        return this.runWithLock(task, fn);
     }
 
     async runWithLock(task: Task, fn: () => Promise<IndexerRunResult>): Promise<IndexerRunResult | null> {
