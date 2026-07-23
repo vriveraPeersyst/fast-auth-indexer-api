@@ -49,27 +49,26 @@ export class NearBlockService {
 
     /**
      * Decide whether a "block-by-height" RPC failure means the height is
-     * genuinely missing on-chain. Requires:
+     * genuinely missing on-chain (a pruned block or a NEAR skipped height —
+     * an empty slot where no block was produced). Requires:
      *   - The error to be `NearRpcExhaustedError` (full retry loop, not a
      *     transient single-call failure).
      *   - The error message to mention `block-by-height` (we don't apply this
      *     classification to chunk lookups or other RPC verbs).
-     *   - Every endpoint we actually contacted to have reported the block
-     *     missing (a contacted endpoint that failed for another reason, e.g.
-     *     a 429, means the block may still exist there), with at least two
-     *     endpoints agreeing (a single-endpoint transient must not advance
-     *     the checkpoint).
-     *
-     * Endpoints have heterogeneous pruning horizons (e.g. lava ~58h vs
-     * fastnear ~20h), so a quorum across the whole pool would wrongly skip
-     * blocks that a longer-retention endpoint still serves. Requiring
-     * unanimous agreement among only the endpoints actually reached avoids
-     * that false positive while still catching genuinely pruned heights.
+     *   - The block to be reported missing by all-but-at-most-one contacted
+     *     endpoint, with at least two agreeing. Skipped heights return
+     *     UNKNOWN_BLOCK on every endpoint, but one endpoint frequently answers
+     *     with a transient error ("Temporary internal error, please retry")
+     *     instead — requiring strict unanimity wedged those heights, spamming
+     *     the missing-ranges ledger with 1-block "wedged frontier" rows.
+     *     Tolerating a single outlier fixes that without over-skipping: if any
+     *     endpoint had actually served the block, `request()` would have
+     *     returned it and this method would never run.
      */
     isSkippableMissingHeightError(error: unknown): boolean {
         if (!(error instanceof NearRpcExhaustedError)) return false;
         if (!error.message.includes("block-by-height")) return false;
         const missing = error.unknownBlockEndpoints.size;
-        return missing >= 2 && missing >= error.contactedEndpointCount;
+        return missing >= 2 && missing >= error.contactedEndpointCount - 1;
     }
 }
