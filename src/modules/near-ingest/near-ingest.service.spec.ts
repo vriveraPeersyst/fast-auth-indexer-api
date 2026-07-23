@@ -259,6 +259,31 @@ describe("NearIngestService", () => {
         expect(result.details).not.toMatch(/deferred \d+ heights/);
     });
 
+    it("force-resets to tip-12h and ledgers the gap when the scanned head is deep in the pruned band", async () => {
+        const latestHeight = 200_000_000;
+        const scanned = latestHeight - 300_000; // ~50h behind, well past the 18h reset threshold
+        const skipTarget = latestHeight - Math.round((12 * 3600) / 0.61); // tip-12h
+        nearBlock.fetchFinalBlock.mockResolvedValue({
+            result: { header: { height: latestHeight, hash: "tipHash", timestamp: 1_700_000_000_000_000 }, chunks: [] },
+        });
+        checkpoints.get.mockImplementation((k: string) => {
+            if (k === "near_last_scanned_height") return String(scanned);
+            return null;
+        });
+
+        const result = await service.runOnce();
+
+        expect(result.status).toBe("ok");
+        expect(result.details).toMatch(/Force-reset to tip-12h/);
+        // Gap ledgered and the checkpoint jumped to tip-12h...
+        expect(missingRangeRepo.insert).toHaveBeenCalledTimes(1);
+        expect(checkpoints.setMany).toHaveBeenCalledWith(
+            expect.arrayContaining([{ key: "near_last_scanned_height", value: String(skipTarget - 1) }]),
+        );
+        // ...and it returned early WITHOUT walking any blocks this tick.
+        expect(nearBlock.fetchChunkByHash).not.toHaveBeenCalled();
+    });
+
     it("skips a wedged frontier height (unfetchable on all endpoints), ledgers it, and advances past it", async () => {
         const latestHeight = 200_000_000;
         // window [L-2, L-1, L]; L is served from latestPayload.

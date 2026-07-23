@@ -57,6 +57,14 @@ const NEAR_HOLE_RETRY_DELAY_MS = 4000;
 // and skipped past (ledgered), so one pruned/broken block can't wedge the
 // checkpoint forever. A single transient run still just defers to the next run.
 const NEAR_WEDGE_SKIP_AFTER_RUNS = 2;
+// Periodic force-reset. Checked every near-ingest tick: if the scanned head has
+// drifted this many blocks behind (~18h), it is inside the free pool's deep
+// pruned band where catch-up is impossible, so jump to tip-12h and ledger the
+// gap — keeping the indexer live near the tip instead of dying days behind. The
+// boot-guard does the same at startup; this keeps it healthy without a redeploy.
+const NEAR_BLOCK_TIME_SECONDS = 0.61;
+const NEAR_SKIP_TARGET_LAG_BLOCKS = Math.round((12 * 3600) / NEAR_BLOCK_TIME_SECONDS);
+const NEAR_FORCE_RESET_LAG_BLOCKS = Math.round((18 * 3600) / NEAR_BLOCK_TIME_SECONDS);
 // The relayer mart is a full-table re-aggregation of fastauth_sign_events
 // (3 GROUP BYs + DELETE/re-INSERT) whose cost grows with the table. Running it
 // every cycle that persisted events dominates per-run overhead during tip
@@ -158,6 +166,42 @@ export class NearIngestService {
             }
 
             const { startHeight, targetHeight } = await this.computeRange(latestHeight);
+
+            // Periodic force-reset — runs under this task's own re-entrancy lock,
+            // so there is no race with the checkpoint writes below (unlike a
+            // boot-only or cron-based reset). If the scanned head has drifted
+            // past NEAR_FORCE_RESET_LAG_BLOCKS it is in the free pool's deep
+            // pruned band where catch-up is hopeless; jump to tip-12h, ledger the
+            // skipped range, and resume near the tip next tick.
+            const lag = latestHeight - (startHeight - 1);
+            if (lag >= NEAR_FORCE_RESET_LAG_BLOCKS) {
+                const skipTarget = latestHeight - NEAR_SKIP_TARGET_LAG_BLOCKS;
+                if (skipTarget > startHeight) {
+                    await this.recordSkippedRange(
+                        startHeight,
+                        skipTarget - 1,
+                        `periodic force-reset: scanned head ${lag} blocks behind — inside the free RPC pool's deep pruned band (unrecoverable). Requires archival-backed backfill.`,
+                    );
+                    await this.checkpoints.setMany([
+                        { key: CHECKPOINT_SCANNED_HEIGHT, value: String(skipTarget - 1) },
+                        { key: CHECKPOINT_HEIGHT, value: String(skipTarget - 1) },
+                        { key: CHECKPOINT_CHAIN_HEAD_HEIGHT, value: String(latestHeight) },
+                        { key: CHECKPOINT_CHAIN_HEAD_HASH, value: latestHash },
+                    ]);
+                    this.logger.warn(
+                        `near-ingest force-reset: lag ${lag} >= ${NEAR_FORCE_RESET_LAG_BLOCKS}; ledgered ${startHeight}..${
+                            skipTarget - 1
+                        } and jumped to tip-12h (${skipTarget}). Resumes near the tip next tick.`,
+                    );
+                    return {
+                        source: SOURCE,
+                        status: "ok",
+                        details: `Force-reset to tip-12h: lag ${lag} blocks; ledgered ${startHeight}..${
+                            skipTarget - 1
+                        }; resume at ${skipTarget}.`,
+                    };
+                }
+            }
 
             // Persist chain-head + (first-run only) backfill origin in a
             // single bulk upsert instead of 2-3 sequential roundtrips. The
