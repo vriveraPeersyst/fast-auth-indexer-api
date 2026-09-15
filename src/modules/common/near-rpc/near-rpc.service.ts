@@ -19,6 +19,11 @@ const DEFAULT_RETRY_BASE_DELAY_MS = 300;
 const DEFAULT_BLACKLIST_DURATION_MS = 60 * 1000;
 const DEFAULT_MAX_RPC_FAILURES = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
+// Global outbound cap across every caller of this (singleton) service, retries
+// included. With empty chunks skipped a block costs ~2.7 requests, so 40 req/s
+// ≈ 15 blocks/s ≈ 9× chain speed while catching up — well under drpc's measured
+// ~119 req/s free-tier ceiling. At the tip the chain itself bounds us to ~3 req/s.
+const DEFAULT_MAX_REQUESTS_PER_SECOND = 40;
 const DEFAULT_REQUEST_ID = "fast-auth-indexer-api";
 
 // Hardcoded NEAR RPC pool. Free public endpoints only. Ordered by sustained
@@ -69,6 +74,8 @@ export interface NearRpcServiceOptions {
     maxAttempts?: number;
     baseDelayMs?: number;
     requestTimeoutMs?: number;
+    /** Outbound request cap; 0 disables it. */
+    maxRequestsPerSecond?: number;
     requestId?: string;
     bearerToken?: string | null;
 }
@@ -81,6 +88,8 @@ export class NearRpcService {
     private readonly maxAttempts: number;
     private readonly baseDelayMs: number;
     private readonly requestTimeoutMs: number;
+    private readonly requestIntervalMs: number;
+    private nextRequestSlotMs = 0;
     private readonly requestId: string;
     private readonly bearerToken: string | null;
     // Per-endpoint outcome counters ("200", "429", "410", "rpc-error",
@@ -109,6 +118,8 @@ export class NearRpcService {
         this.baseDelayMs = options?.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
         this.maxAttempts = options?.maxAttempts ?? Math.max(this.endpoints.length * 2, DEFAULT_RETRY_COUNT);
         this.requestTimeoutMs = options?.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+        const maxRps = options?.maxRequestsPerSecond ?? DEFAULT_MAX_REQUESTS_PER_SECOND;
+        this.requestIntervalMs = maxRps > 0 ? 1000 / maxRps : 0;
         this.requestId = options?.requestId ?? DEFAULT_REQUEST_ID;
         this.bearerToken = options?.bearerToken?.trim() ? options.bearerToken.trim() : null;
     }
@@ -160,6 +171,17 @@ export class NearRpcService {
         const picked = best ?? available[0];
         picked.currentWeight -= totalWeight;
         return picked;
+    }
+
+    // Evenly spaced slots: each caller reserves the next free slot synchronously
+    // (atomic under JS's single thread), then sleeps until it. No bursts, so a
+    // run's 16×6 fan-out queues here instead of tripping provider rate limits.
+    private async acquireRequestSlot(): Promise<void> {
+        if (this.requestIntervalMs === 0) return;
+        const now = Date.now();
+        const slot = Math.max(now, this.nextRequestSlotMs);
+        this.nextRequestSlotMs = slot + this.requestIntervalMs;
+        if (slot > now) await sleep(slot - now);
     }
 
     private recordOutcome(url: string, outcome: string): void {
@@ -228,6 +250,7 @@ export class NearRpcService {
         const healthyEndpointCount = this.endpoints.length;
 
         for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+            await this.acquireRequestSlot();
             const endpoint = this.pickNextEndpoint();
             contactedEndpoints.add(endpoint.url);
             const abortController = new AbortController();

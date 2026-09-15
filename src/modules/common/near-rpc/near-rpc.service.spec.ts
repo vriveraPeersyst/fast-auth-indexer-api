@@ -101,3 +101,36 @@ describe("NearRpcService outcome summary", () => {
         expect(svc.drainOutcomeSummary()).toBe("");
     });
 });
+
+describe("NearRpcService request rate cap", () => {
+    const realFetch = global.fetch;
+    afterEach(() => {
+        global.fetch = realFetch;
+        jest.useRealTimers();
+    });
+
+    it("spaces concurrent requests to at most maxRequestsPerSecond", async () => {
+        jest.useFakeTimers();
+        const sentAt: number[] = [];
+        global.fetch = jest.fn().mockImplementation(async () => {
+            sentAt.push(Date.now());
+            return { ok: true, status: 200, json: async () => ({ result: {} }) };
+        });
+        const svc = new NearRpcService({ urls: ["https://a.example"], maxRequestsPerSecond: 10 });
+
+        const all = Promise.all(Array.from({ length: 5 }, () => svc.request("block", {}, "block")));
+        await jest.advanceTimersByTimeAsync(1000);
+        await all;
+
+        expect(sentAt).toHaveLength(5);
+        for (let i = 1; i < sentAt.length; i += 1) expect(sentAt[i] - sentAt[i - 1]).toBeGreaterThanOrEqual(100);
+    });
+
+    it("does not throttle when the cap is disabled", async () => {
+        global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ result: {} }) });
+        const svc = new NearRpcService({ urls: ["https://a.example"], maxRequestsPerSecond: 0 });
+        const started = Date.now();
+        await Promise.all(Array.from({ length: 20 }, () => svc.request("block", {}, "block")));
+        expect(Date.now() - started).toBeLessThan(100);
+    });
+});
