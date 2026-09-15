@@ -20,7 +20,13 @@ import {
     normalizeNearPublicKey,
 } from "./conversion.helpers";
 import { extractDelegateActionInfo } from "./delegate.helpers";
-import { NearBlockResponse, NearBlockService, NearChunkResponse, NearChunkTransaction } from "./near-block.service";
+import {
+    chunkHashesWithTransactions,
+    NearBlockResponse,
+    NearBlockService,
+    NearChunkResponse,
+    NearChunkTransaction,
+} from "./near-block.service";
 import { RelayerMartsService } from "./relayer-marts.service";
 import { deriveFastAuthSignEvents, FastAuthSignEventSeed } from "./sign-event-derivator";
 
@@ -53,18 +59,22 @@ const NEAR_PROGRESS_LOG_EVERY_BLOCKS = 50;
 const NEAR_HOLE_RETRY_ROUNDS = 3;
 const NEAR_HOLE_RETRY_DELAY_MS = 4000;
 // A frontier height that keeps failing after this many consecutive runs (all
-// its in-run retries exhausted each time) is treated as genuinely unfetchable
-// and skipped past (ledgered), so one pruned/broken block can't wedge the
-// checkpoint forever. A single transient run still just defers to the next run.
+// its in-run retries exhausted each time) AND whose last error is an
+// UNKNOWN_BLOCK/UNKNOWN_CHUNK agreement across endpoints is treated as
+// genuinely unfetchable and skipped past (ledgered), so one pruned/broken block
+// can't wedge the checkpoint forever. Heights failing on 429s/timeouts are
+// never skipped: those blocks exist and ledgering them was what flooded the
+// /status missing-ranges table (~24 real-block ranges/day, Aug–Sep 2026).
 const NEAR_WEDGE_SKIP_AFTER_RUNS = 2;
 // Periodic force-reset. Checked every near-ingest tick: if the scanned head has
-// drifted this many blocks behind (~18h), it is inside the free pool's deep
-// pruned band where catch-up is impossible, so jump to tip-12h and ledger the
-// gap — keeping the indexer live near the tip instead of dying days behind. The
-// boot-guard does the same at startup; this keeps it healthy without a redeploy.
+// drifted this many blocks behind (~30h), it is near drpc's ~35h retention
+// horizon where catch-up is impossible, so jump to tip-12h and ledger the gap —
+// keeping the indexer live near the tip instead of dying days behind. Was 18h,
+// but drpc and fastnear still serve 18h-old blocks (verified 2026-09-15), so
+// 18h ledgered recoverable blocks. Last-resort only; the boot-guard mirrors it.
 const NEAR_BLOCK_TIME_SECONDS = 0.61;
 const NEAR_SKIP_TARGET_LAG_BLOCKS = Math.round((12 * 3600) / NEAR_BLOCK_TIME_SECONDS);
-const NEAR_FORCE_RESET_LAG_BLOCKS = Math.round((18 * 3600) / NEAR_BLOCK_TIME_SECONDS);
+const NEAR_FORCE_RESET_LAG_BLOCKS = Math.round((30 * 3600) / NEAR_BLOCK_TIME_SECONDS);
 // The relayer mart is a full-table re-aggregation of fastauth_sign_events
 // (3 GROUP BYs + DELETE/re-INSERT) whose cost grows with the table. Running it
 // every cycle that persisted events dominates per-run overhead during tip
@@ -265,6 +275,7 @@ export class NearIngestService {
             // checkpoint stops just before the first hole and those heights are
             // retried next run. Everything fetchable still commits this run.
             let lastHeightError: unknown = null;
+            const heightErrors = new Map<number, unknown>();
             const runHeights = async (batch: number[]): Promise<number[]> => {
                 const failed: number[] = [];
                 await runWithConcurrency(batch, NEAR_BLOCK_CONCURRENCY, async (height) => {
@@ -285,6 +296,7 @@ export class NearIngestService {
                     } catch (error) {
                         failed.push(height);
                         lastHeightError = error;
+                        heightErrors.set(height, error);
                     }
                 });
                 return failed;
@@ -337,7 +349,7 @@ export class NearIngestService {
                     const failed = new Set(failedHeights);
                     let wedgeEnd = startHeight - 1;
                     for (let h = startHeight; h <= targetHeight; h += 1) {
-                        if (!failed.has(h)) break;
+                        if (!failed.has(h) || !this.nearBlock.isUnfetchableEverywhereError(heightErrors.get(h))) break;
                         wedgeEnd = h;
                     }
                     if (wedgeEnd >= startHeight) {
@@ -365,6 +377,10 @@ export class NearIngestService {
             if (highestContiguous >= startHeight) {
                 await this.persistRunCheckpoints(highestContiguous, stats);
             }
+            this.logger.log(
+                `NEAR collector run done: advanced ${Math.max(0, highestContiguous - startHeight + 1)}/${heights.length} ` +
+                    `in ${Math.round((Date.now() - startedAt) / 1000)}s; rpc ${this.nearBlock.drainRpcOutcomeSummary()}`,
+            );
 
             // Mark the mart dirty when this cycle persisted sign events, then
             // rebuild only if the throttle window has elapsed. This keeps the
@@ -562,7 +578,7 @@ export class NearIngestService {
             throw new Error(`NEAR response missing block details for height ${params.height}.`);
         }
 
-        const chunkHashes = blockPayload.result?.chunks?.map((c) => c.chunk_hash).filter((h): h is string => Boolean(h)) ?? [];
+        const chunkHashes = chunkHashesWithTransactions(blockPayload);
 
         const uniqueTransactions = new Map<string, NearTxRow>();
         const uniqueSignEvents = new Map<string, FastAuthSignEventSeed>();

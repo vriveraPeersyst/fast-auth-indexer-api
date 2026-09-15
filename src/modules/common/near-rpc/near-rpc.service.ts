@@ -19,31 +19,31 @@ const DEFAULT_RETRY_BASE_DELAY_MS = 300;
 const DEFAULT_BLACKLIST_DURATION_MS = 60 * 1000;
 const DEFAULT_MAX_RPC_FAILURES = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
+// Global outbound cap across every caller of this (singleton) service, retries
+// included. With empty chunks skipped a block costs ~2.7 requests, so 40 req/s
+// ≈ 15 blocks/s ≈ 9× chain speed while catching up — well under drpc's measured
+// ~119 req/s free-tier ceiling. At the tip the chain itself bounds us to ~3 req/s.
+const DEFAULT_MAX_REQUESTS_PER_SECOND = 40;
 const DEFAULT_REQUEST_ID = "fast-auth-indexer-api";
 
 // Hardcoded NEAR RPC pool. Free public endpoints only. Ordered by sustained
 // capacity measured 2026-07-07 (drpc ~119 req/s @ 0% 429, lava ~32, then
 // fastnear/shitzu). Dropped near.blockpi.network (now 402/503 "Apikey not
 // found" — paywalled) and 1rpc.io/near (does not implement the `block` method,
-// -32601); both only fed the blacklist cascade. Non-archival: none serve
-// blocks older than ~20–58h — see the skip-forward guard for the pruning trap.
-export const NEAR_RPC_URLS = [
-    "https://near.drpc.org",
-    "https://near.lava.build",
-    "https://free.rpc.fastnear.com",
-    "https://rpc.shitzuapes.xyz",
-];
+// -32601); both only fed the blacklist cascade. Dropped near.lava.build
+// 2026-09-15 (HTTP 410 "This endpoint has been discontinued") — at weight 5 it
+// burned a third of all attempts. Non-archival: none serve blocks older than
+// ~20–35h — see the skip-forward guard for the pruning trap.
+export const NEAR_RPC_URLS = ["https://near.drpc.org", "https://free.rpc.fastnear.com", "https://rpc.shitzuapes.xyz"];
 
 // Capacity weights (measured 2026-07-07). drpc sustains ~119 req/s @ 0% 429 and
-// retains ~35h; lava ~32 req/s and retains ~58h (the deepest). fastnear/shitzu
-// 429 at very low concurrency AND prune earliest (~20h), so they are weighted
-// down hard — most traffic goes to drpc/lava, and crucially in the 20–58h band
-// where fastnear/shitzu no longer serve the block at all, we stop wasting
-// attempts (and forming holes) on them. Blacklisted endpoints are already
+// retains ~35h. fastnear/shitzu 429 at very low concurrency AND prune earliest
+// (~20h), so they are weighted down hard — most traffic goes to drpc, and in
+// the 20–35h band where fastnear/shitzu no longer serve the block at all, we
+// stop wasting attempts (and forming holes) on them. Blacklisted endpoints are already
 // excluded by getAvailableEndpoints, so weights only bias the healthy set.
 export const NEAR_RPC_WEIGHTS: Record<string, number> = {
     "https://near.drpc.org": 8,
-    "https://near.lava.build": 5,
     "https://free.rpc.fastnear.com": 1,
     "https://rpc.shitzuapes.xyz": 1,
 };
@@ -74,6 +74,8 @@ export interface NearRpcServiceOptions {
     maxAttempts?: number;
     baseDelayMs?: number;
     requestTimeoutMs?: number;
+    /** Outbound request cap; 0 disables it. */
+    maxRequestsPerSecond?: number;
     requestId?: string;
     bearerToken?: string | null;
 }
@@ -86,8 +88,15 @@ export class NearRpcService {
     private readonly maxAttempts: number;
     private readonly baseDelayMs: number;
     private readonly requestTimeoutMs: number;
+    private readonly requestIntervalMs: number;
+    private nextRequestSlotMs = 0;
     private readonly requestId: string;
     private readonly bearerToken: string | null;
+    // Per-endpoint outcome counters ("200", "429", "410", "rpc-error",
+    // "timeout", …) since the last drainOutcomeSummary(). The ingest run logs
+    // them so provider throttling is visible instead of surfacing only as
+    // "N still failing" holes.
+    private outcomes = new Map<string, Map<string, number>>();
 
     constructor(@Optional() options?: NearRpcServiceOptions) {
         const urls = options?.urls ?? NEAR_RPC_URLS;
@@ -109,6 +118,8 @@ export class NearRpcService {
         this.baseDelayMs = options?.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
         this.maxAttempts = options?.maxAttempts ?? Math.max(this.endpoints.length * 2, DEFAULT_RETRY_COUNT);
         this.requestTimeoutMs = options?.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+        const maxRps = options?.maxRequestsPerSecond ?? DEFAULT_MAX_REQUESTS_PER_SECOND;
+        this.requestIntervalMs = maxRps > 0 ? 1000 / maxRps : 0;
         this.requestId = options?.requestId ?? DEFAULT_REQUEST_ID;
         this.bearerToken = options?.bearerToken?.trim() ? options.bearerToken.trim() : null;
     }
@@ -162,6 +173,37 @@ export class NearRpcService {
         return picked;
     }
 
+    // Evenly spaced slots: each caller reserves the next free slot synchronously
+    // (atomic under JS's single thread), then sleeps until it. No bursts, so a
+    // run's 16×6 fan-out queues here instead of tripping provider rate limits.
+    private async acquireRequestSlot(): Promise<void> {
+        if (this.requestIntervalMs === 0) return;
+        const now = Date.now();
+        const slot = Math.max(now, this.nextRequestSlotMs);
+        this.nextRequestSlotMs = slot + this.requestIntervalMs;
+        if (slot > now) await sleep(slot - now);
+    }
+
+    private recordOutcome(url: string, outcome: string): void {
+        let counts = this.outcomes.get(url);
+        if (!counts) {
+            counts = new Map();
+            this.outcomes.set(url, counts);
+        }
+        counts.set(outcome, (counts.get(outcome) ?? 0) + 1);
+    }
+
+    /** Returns "host{outcome=n,…} …" for requests since the last call and resets the counters. */
+    drainOutcomeSummary(): string {
+        const parts: string[] = [];
+        for (const [url, counts] of this.outcomes) {
+            const detail = [...counts].map(([outcome, n]) => `${outcome}=${n}`).join(",");
+            parts.push(`${url.replace(/^https?:\/\//, "")}{${detail}}`);
+        }
+        this.outcomes = new Map();
+        return parts.join(" ");
+    }
+
     private isRateLimit(status: number, message: string): boolean {
         if (status === 429) return true;
         return (
@@ -208,6 +250,7 @@ export class NearRpcService {
         const healthyEndpointCount = this.endpoints.length;
 
         for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+            await this.acquireRequestSlot();
             const endpoint = this.pickNextEndpoint();
             contactedEndpoints.add(endpoint.url);
             const abortController = new AbortController();
@@ -234,6 +277,7 @@ export class NearRpcService {
                     }`;
 
                     if (isUnknownBlockMessage(snippet)) unknownBlockEndpoints.add(endpoint.url);
+                    this.recordOutcome(endpoint.url, String(response.status));
                     lastError = new Error(message);
                     this.handleFailure(endpoint, response.status, snippet || message);
                 } else {
@@ -243,13 +287,16 @@ export class NearRpcService {
                         const snippet = JSON.stringify(payload.error).slice(0, 220).replace(/\s+/g, " ");
                         const message = `NEAR ${contextLabel} RPC error via ${endpoint.url}${snippet ? `: ${snippet}` : "."}`;
 
-                        if (isUnknownBlockMessage(snippet)) unknownBlockEndpoints.add(endpoint.url);
+                        const unknown = isUnknownBlockMessage(snippet);
+                        if (unknown) unknownBlockEndpoints.add(endpoint.url);
+                        this.recordOutcome(endpoint.url, unknown ? "unknown-block" : "rpc-error");
                         lastError = new Error(message);
                         this.handleFailure(endpoint, response.status, snippet || message);
                     } else {
                         endpoint.failures = 0;
                         endpoint.isBlacklisted = false;
                         endpoint.lastFailure = undefined;
+                        this.recordOutcome(endpoint.url, "ok");
                         return payload as TResponse;
                     }
                 }
@@ -261,6 +308,7 @@ export class NearRpcService {
                             : error.message
                         : `Unknown NEAR ${contextLabel} request failure via ${endpoint.url}.`;
 
+                this.recordOutcome(endpoint.url, message.startsWith("timeout") ? "timeout" : "network");
                 lastError = new Error(`NEAR ${contextLabel} request failed via ${endpoint.url}: ${message}`);
                 this.handleFailure(endpoint, null, message);
             } finally {
