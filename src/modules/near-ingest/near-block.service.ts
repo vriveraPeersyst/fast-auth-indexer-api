@@ -6,9 +6,34 @@ import { NearRpcService } from "../common/near-rpc/near-rpc.service";
 export type NearBlockResponse = {
     result?: {
         header?: { height?: number; hash?: string; timestamp?: number };
-        chunks?: Array<{ chunk_hash?: string }>;
+        chunks?: Array<{ chunk_hash?: string; height_included?: number; tx_root?: string }>;
     };
 };
+
+// Merkle root of an empty transaction list (32 zero bytes, base58). ~83% of
+// mainnet chunks carry it (measured 2026-09-15 over 200 blocks × 10 shards).
+export const NEAR_EMPTY_TX_ROOT = "11111111111111111111111111111111";
+
+/**
+ * Chunk hashes of `block` worth fetching for transactions. Skips chunks whose
+ * tx_root is the empty root (no transactions) and chunks not produced at this
+ * height (height_included != header height: the shard missed its slot and the
+ * header repeats the previous chunk, whose txs were indexed with that block).
+ * Missing fields are treated as "fetch" so a partial payload never drops txs.
+ * Cuts chunk RPCs per block from ~10 to ~1.7 — the free pool's rate limits,
+ * not pruning, were what kept the indexer behind the chain.
+ */
+export function chunkHashesWithTransactions(block: NearBlockResponse): string[] {
+    const height = block.result?.header?.height;
+    const hashes: string[] = [];
+    for (const chunk of block.result?.chunks ?? []) {
+        if (!chunk.chunk_hash) continue;
+        if (chunk.tx_root === NEAR_EMPTY_TX_ROOT) continue;
+        if (height !== undefined && chunk.height_included !== undefined && chunk.height_included !== height) continue;
+        hashes.push(chunk.chunk_hash);
+    }
+    return hashes;
+}
 
 export type NearChunkTransaction = {
     hash?: string;
@@ -43,6 +68,11 @@ export class NearBlockService {
         return this.nearRpc.request<NearBlockResponse>("block", { block_id: height }, `block-by-height ${height}`);
     }
 
+    /** Per-endpoint RPC outcome counts since the last call (see NearRpcService). */
+    drainRpcOutcomeSummary(): string {
+        return this.nearRpc.drainOutcomeSummary();
+    }
+
     fetchChunkByHash(chunkHash: string): Promise<NearChunkResponse> {
         return this.nearRpc.request<NearChunkResponse>("chunk", { chunk_id: chunkHash }, `chunk-by-hash ${chunkHash}`);
     }
@@ -68,6 +98,21 @@ export class NearBlockService {
     isSkippableMissingHeightError(error: unknown): boolean {
         if (!(error instanceof NearRpcExhaustedError)) return false;
         if (!error.message.includes("block-by-height")) return false;
+        return this.isReportedMissingEverywhere(error);
+    }
+
+    /**
+     * True when a block OR chunk fetch exhausted its retries with the same
+     * agreement rule as isSkippableMissingHeightError (>=2 contacted endpoints,
+     * at most one outlier, reported UNKNOWN_BLOCK/UNKNOWN_CHUNK/DB Not Found).
+     * The wedge-skip uses this so a frontier that only fails on 429s/timeouts
+     * is retried instead of being ledgered as a "missing" range of real blocks.
+     */
+    isUnfetchableEverywhereError(error: unknown): boolean {
+        return error instanceof NearRpcExhaustedError && this.isReportedMissingEverywhere(error);
+    }
+
+    private isReportedMissingEverywhere(error: NearRpcExhaustedError): boolean {
         const missing = error.unknownBlockEndpoints.size;
         return missing >= 2 && missing >= error.contactedEndpointCount - 1;
     }

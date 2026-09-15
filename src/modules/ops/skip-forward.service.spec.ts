@@ -107,11 +107,11 @@ describe("SkipForwardService", () => {
     });
 
     describe("autoSkipIfStranded", () => {
-        // Bands (defaults): healthy < 12h ; recover-or-reset [12h, 18h) ; force-reset >= 18h.
-        const inBand = TIP - lagBlocksFor(15); // 15h behind → inside [12h, 18h)
+        // Bands (defaults): healthy < 12h ; recover-or-reset [12h, 30h) ; force-reset >= 30h.
+        const inBand = TIP - lagBlocksFor(15); // 15h behind → inside [12h, 30h)
 
-        it("force-resets when lag >= 18h even if the next block is still served", async () => {
-            checkpoints.get.mockResolvedValue("100000000"); // ~massively behind (>> 18h)
+        it("force-resets when lag >= 30h even if the next block is still served", async () => {
+            checkpoints.get.mockResolvedValue("100000000"); // ~massively behind (>> 30h)
             nearBlock.fetchFinalBlock.mockResolvedValue({ result: { header: { height: TIP, hash: "tipHash" } } });
             // Block IS served — under the old rule this would return null; the
             // force-reset must skip anyway. (This call only serves the hash fetch.)
@@ -133,7 +133,7 @@ describe("SkipForwardService", () => {
             expect(nearBlock.fetchBlockByHeight).not.toHaveBeenCalled();
         });
 
-        it("resets in the [12h,18h) band when the next height is pruned everywhere", async () => {
+        it("resets in the [12h,30h) band when the next height is pruned everywhere", async () => {
             checkpoints.get.mockResolvedValue(String(inBand));
             nearBlock.fetchFinalBlock.mockResolvedValue({ result: { header: { height: TIP, hash: "tipHash" } } });
             nearBlock.fetchBlockByHeight
@@ -147,7 +147,7 @@ describe("SkipForwardService", () => {
             expect(missingRangeRepo.insert).toHaveBeenCalledTimes(1);
         });
 
-        it("does nothing in the [12h,18h) band when the next height is still served (recoverable)", async () => {
+        it("does nothing in the [12h,30h) band when the next height is still served (recoverable)", async () => {
             checkpoints.get.mockResolvedValue(String(inBand));
             nearBlock.fetchFinalBlock.mockResolvedValue({ result: { header: { height: TIP, hash: "tipHash" } } });
             nearBlock.fetchBlockByHeight.mockResolvedValue({ result: { header: { height: inBand + 1, hash: "h" } } });
@@ -158,7 +158,7 @@ describe("SkipForwardService", () => {
             expect(missingRangeRepo.insert).not.toHaveBeenCalled();
         });
 
-        it("does nothing in the [12h,18h) band when the probe error is ambiguous (not skippable)", async () => {
+        it("does nothing in the [12h,30h) band when the probe error is ambiguous (not skippable)", async () => {
             checkpoints.get.mockResolvedValue(String(inBand));
             nearBlock.fetchFinalBlock.mockResolvedValue({ result: { header: { height: TIP, hash: "tipHash" } } });
             nearBlock.fetchBlockByHeight.mockRejectedValue(new Error("429"));

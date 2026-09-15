@@ -7,13 +7,8 @@ describe("NEAR_RPC_URLS", () => {
         expect(NEAR_RPC_URLS).not.toContain("https://1rpc.io/near");
     });
 
-    it("keeps the four working endpoints with drpc first (highest measured capacity)", () => {
-        expect(NEAR_RPC_URLS).toEqual([
-            "https://near.drpc.org",
-            "https://near.lava.build",
-            "https://free.rpc.fastnear.com",
-            "https://rpc.shitzuapes.xyz",
-        ]);
+    it("keeps the three working endpoints with drpc first (lava.build discontinued, HTTP 410)", () => {
+        expect(NEAR_RPC_URLS).toEqual(["https://near.drpc.org", "https://free.rpc.fastnear.com", "https://rpc.shitzuapes.xyz"]);
     });
 });
 
@@ -83,6 +78,26 @@ describe("NearRpcService capacity-weighted routing", () => {
 
     it("gives drpc the highest default weight and the weak endpoints the lowest", () => {
         expect(NEAR_RPC_WEIGHTS["https://near.drpc.org"]).toBeGreaterThan(NEAR_RPC_WEIGHTS["https://free.rpc.fastnear.com"]);
-        expect(NEAR_RPC_WEIGHTS["https://near.drpc.org"]).toBeGreaterThanOrEqual(NEAR_RPC_WEIGHTS["https://near.lava.build"]);
+        expect(NEAR_RPC_WEIGHTS["https://near.drpc.org"]).toBeGreaterThan(NEAR_RPC_WEIGHTS["https://rpc.shitzuapes.xyz"]);
+    });
+});
+
+describe("NearRpcService outcome summary", () => {
+    const realFetch = global.fetch;
+    afterEach(() => {
+        global.fetch = realFetch;
+    });
+
+    it("counts per-endpoint outcomes and resets them on drain", async () => {
+        global.fetch = jest
+            .fn()
+            .mockResolvedValueOnce({ ok: false, status: 429, text: async () => "Too Many Requests" })
+            .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ result: {} }) });
+        const svc = new NearRpcService({ urls: ["https://a.example"], baseDelayMs: 0, maxAttempts: 2 });
+
+        await svc.request("block", {}, "block-by-height 1");
+
+        expect(svc.drainOutcomeSummary()).toBe("a.example{429=1,ok=1}");
+        expect(svc.drainOutcomeSummary()).toBe("");
     });
 });

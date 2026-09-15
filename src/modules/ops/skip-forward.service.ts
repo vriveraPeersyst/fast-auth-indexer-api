@@ -21,8 +21,9 @@ const DEFAULT_SKIP_HOURS_BACK = 12;
 // Above this lag the checkpoint is in/near the pruned band and cannot catch up
 // on the free pool — the boot guard force-resets to tip-DEFAULT_SKIP_HOURS_BACK
 // even if drpc/lava still serve the next block. Must exceed the skip target so
-// a healthy indexer running a few hours behind is left alone.
-const DEFAULT_MAX_LAG_HOURS = 18;
+// a healthy indexer running a few hours behind is left alone. 30h (was 18h):
+// drpc still serves ~35h-old blocks, so an 18h reset ledgered recoverable data.
+const DEFAULT_MAX_LAG_HOURS = 30;
 
 export type SkipForwardSummary = {
     currentScannedHeight: number;

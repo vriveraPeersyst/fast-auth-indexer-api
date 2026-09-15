@@ -44,6 +44,8 @@ describe("NearIngestService", () => {
         fetchBlockByHeight: jest.Mock;
         fetchChunkByHash: jest.Mock;
         isSkippableMissingHeightError: jest.Mock;
+        isUnfetchableEverywhereError: jest.Mock;
+        drainRpcOutcomeSummary: jest.Mock;
     };
     let pricing: { refresh: jest.Mock; computeActionsValue: jest.Mock };
     let relayerMarts: { rebuild: jest.Mock };
@@ -83,6 +85,8 @@ describe("NearIngestService", () => {
             fetchBlockByHeight: jest.fn(),
             fetchChunkByHash: jest.fn().mockResolvedValue({ result: { transactions: [] } }),
             isSkippableMissingHeightError: jest.fn().mockReturnValue(false),
+            isUnfetchableEverywhereError: jest.fn().mockReturnValue(true),
+            drainRpcOutcomeSummary: jest.fn().mockReturnValue(""),
         };
         pricing = {
             refresh: jest.fn().mockResolvedValue(null),
@@ -325,6 +329,57 @@ describe("NearIngestService", () => {
         );
         // ...and the checkpoint advanced past it to the window end (not wedged at 0).
         expect(second.details).toMatch(/persisted up to height 200000000/);
+    });
+
+    it("never ledgers a stuck frontier whose failures are not pruning (429s/timeouts): it keeps retrying", async () => {
+        const latestHeight = 200_000_000;
+        nearBlock.fetchFinalBlock.mockResolvedValue({
+            result: { header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 }, chunks: [] },
+        });
+        checkpoints.get.mockImplementation((k: string) => {
+            if (k === "near_last_scanned_height") return String(latestHeight - 3);
+            return null;
+        });
+        nearBlock.fetchBlockByHeight.mockImplementation((h: number) => {
+            if (h === latestHeight - 2) return Promise.reject(new Error("429 Too Many Requests"));
+            return Promise.resolve({
+                result: { header: { height: h, hash: "h" + h, timestamp: 1_700_000_000_000_000 }, chunks: [] },
+            });
+        });
+        nearBlock.isUnfetchableEverywhereError.mockReturnValue(false);
+
+        for (let run = 0; run < 3; run += 1) {
+            const result = await service.runOnce();
+            expect(result.status).toBe("ok");
+            expect(result.details).toMatch(/deferred 1 heights/);
+        }
+        expect(missingRangeRepo.insert).not.toHaveBeenCalled();
+        expect(checkpoints.setMany).not.toHaveBeenCalledWith(
+            expect.arrayContaining([expect.objectContaining({ key: "near_last_scanned_height" })]),
+        );
+    });
+
+    it("fetches only chunks that carry transactions and were produced at this height", async () => {
+        const latestHeight = 200_000_000;
+        nearBlock.fetchFinalBlock.mockResolvedValue({
+            result: {
+                header: { height: latestHeight, hash: "h0", timestamp: 1_700_000_000_000_000 },
+                chunks: [
+                    { chunk_hash: "with-txs", height_included: latestHeight, tx_root: "abc" },
+                    { chunk_hash: "empty", height_included: latestHeight, tx_root: "11111111111111111111111111111111" },
+                    { chunk_hash: "stale", height_included: latestHeight - 1, tx_root: "def" },
+                ],
+            },
+        });
+        checkpoints.get.mockImplementation((k: string) => {
+            if (k === "near_last_scanned_height") return String(latestHeight - 1);
+            return null;
+        });
+
+        await service.runOnce();
+
+        expect(nearBlock.fetchChunkByHash).toHaveBeenCalledTimes(1);
+        expect(nearBlock.fetchChunkByHash).toHaveBeenCalledWith("with-txs");
     });
 
     it("rebuilds marts only when sign events were indexed", async () => {
