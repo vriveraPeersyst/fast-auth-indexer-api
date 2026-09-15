@@ -20,10 +20,12 @@ const DEFAULT_BLACKLIST_DURATION_MS = 60 * 1000;
 const DEFAULT_MAX_RPC_FAILURES = 3;
 const REQUEST_TIMEOUT_MS = 15_000;
 // Global outbound cap across every caller of this (singleton) service, retries
-// included. With empty chunks skipped a block costs ~2.7 requests, so 40 req/s
-// ≈ 15 blocks/s ≈ 9× chain speed while catching up — well under drpc's measured
-// ~119 req/s free-tier ceiling. At the tip the chain itself bounds us to ~3 req/s.
-const DEFAULT_MAX_REQUESTS_PER_SECOND = 40;
+// included. A block costs ~2.7–4.6 requests with empty chunks skipped, so 60
+// req/s ≈ 13–22 blocks/s ≈ 8–13× chain speed while catching up — still under
+// drpc's measured ~119 req/s free-tier ceiling. Raised from 40 after production
+// showed drpc returning 0×429 at 40 (2026-09-15). At the tip the chain itself
+// bounds us to ~3–8 req/s.
+const DEFAULT_MAX_REQUESTS_PER_SECOND = 60;
 const DEFAULT_REQUEST_ID = "fast-auth-indexer-api";
 
 // Hardcoded NEAR RPC pool. Free public endpoints only. Ordered by sustained
