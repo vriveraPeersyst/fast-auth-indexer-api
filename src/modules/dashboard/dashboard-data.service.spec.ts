@@ -17,7 +17,7 @@ import { Relayer } from "../../database/entities/Relayer";
 import { DASHBOARD_DATA_SNAPSHOT_KEY, DashboardDataService } from "./dashboard-data.service";
 
 function makeRepo(): any {
-    return {
+    const repo: any = {
         count: jest.fn().mockResolvedValue(0),
         find: jest.fn().mockResolvedValue([]),
         findOne: jest.fn().mockResolvedValue(null),
@@ -31,6 +31,16 @@ function makeRepo(): any {
             getRawMany: jest.fn().mockResolvedValue([]),
         })),
     };
+    // heavyQuery() runs inside a transaction: `SET LOCAL` is swallowed, the
+    // aggregate itself goes through the same `query` mock tests assert on.
+    repo.manager = {
+        transaction: jest.fn((work: (m: any) => Promise<unknown>) =>
+            work({
+                query: (sql: string, params?: unknown[]) => (sql.startsWith("SET LOCAL") ? Promise.resolve() : repo.query(sql, params)),
+            }),
+        ),
+    };
+    return repo;
 }
 
 describe("DashboardDataService", () => {
@@ -285,6 +295,38 @@ describe("DashboardDataService", () => {
 
         expect(result.accountsOverview.active.all).toBe(100);
         expect(result.accountsOverview.firstSeen.all).toBe(result.accountsOverview.totalAccounts);
+    });
+
+    it("recomputes heavy sections at most every 30 minutes and reuses them in between", async () => {
+        signEventRepo.query.mockResolvedValue([
+            { account_id: "alice.near", sign_events_all: "1", sign_events_30d: "1", sign_events_7d: "1", sign_events_24h: "1" },
+        ]);
+        await service.computeDashboardData();
+        const topAccountCalls = () =>
+            signEventRepo.query.mock.calls.filter((call: any[]) => String(call[0]).includes("GROUP BY user_account_id")).length;
+        expect(topAccountCalls()).toBe(1);
+
+        const second = await service.computeDashboardData();
+        expect(topAccountCalls()).toBe(1);
+        expect(second.topAccounts[0].accountId).toBe("alice.near");
+
+        (service as any).lastHeavyRefreshAtMs = 0;
+        await service.computeDashboardData();
+        expect(topAccountCalls()).toBe(2);
+    });
+
+    it("raises statement_timeout for heavy aggregates inside their own transaction", async () => {
+        const setLocal = jest.fn().mockResolvedValue(undefined);
+        signEventRepo.manager.transaction = jest.fn((work: (m: any) => Promise<unknown>) =>
+            work({
+                query: (sql: string, params?: unknown[]) =>
+                    sql.startsWith("SET LOCAL") ? setLocal(sql) : signEventRepo.query(sql, params),
+            }),
+        );
+
+        await service.computeDashboardData();
+
+        expect(setLocal).toHaveBeenCalledWith(expect.stringMatching(/^SET LOCAL statement_timeout = \d+$/));
     });
 
     it("computes blocksProcessed from completedUpTo + completedDownTo cursors", async () => {

@@ -19,6 +19,10 @@ const SOURCE = "fastauth_health";
 const DISCOVER_LIMIT = 50;
 const RETRY_LIMIT = 25;
 const DISCOVERY_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+// Block-height floor for the discovery scan: the lookback expressed in blocks
+// (~0.61s each) plus 20% margin, so the near_transactions side can use the
+// block_height index instead of scanning the whole table.
+const DISCOVERY_LOOKBACK_BLOCKS = Math.round(((DISCOVERY_LOOKBACK_MS / 1000) * 1.2) / 0.61);
 const MAX_RETRY_COUNT = 10;
 const RETRY_BACKOFF_MS = 5 * 60 * 1000;
 const TX_STATUS_CONCURRENCY = 8;
@@ -114,19 +118,32 @@ export class FastauthHealthService {
     }
 
     private async runDiscoveryPass(lookbackCutoff: Date): Promise<{ ok: number; failed: number; pending: number }> {
+        // Hash anti-join between the two 24h windows. The previous LEFT JOIN
+        // walked near_transactions newest-first and probed the health pkey once
+        // per row until it found 50 unclassified txs — ~11k random reads once
+        // the backlog was caught up, 69.7s on the production volume (2026-09-16),
+        // past the pool timeout. Materializing both windows reads each side
+        // once: 0.7s, independent of how much of the window is classified.
+        // A health row's block_timestamp is its tx's, so the same cutoff bounds
+        // both sides.
         const candidates = await this.nearTxRepository.query<DiscoveryRow[]>(
-            `SELECT n.tx_hash, n.signer_account_id, n.block_height, n.block_timestamp
-             FROM near_transactions n
-             LEFT JOIN fastauth_health_tx h ON h.tx_hash = n.tx_hash
-             WHERE h.tx_hash IS NULL
-               AND n.receiver_id = ANY($1::text[])
-               AND n.block_timestamp >= $2
-               AND n.signer_account_id IS NOT NULL
-               AND n.block_timestamp IS NOT NULL
-               AND n.block_height IS NOT NULL
-             ORDER BY n.block_height DESC
+            `WITH recent AS MATERIALIZED (
+                SELECT n.tx_hash, n.signer_account_id, n.block_height, n.block_timestamp
+                FROM near_transactions n
+                WHERE n.receiver_id = ANY($1::text[])
+                  AND n.block_height >= (SELECT MAX(block_height) - $4 FROM near_transactions)
+                  AND n.block_timestamp >= $2
+                  AND n.signer_account_id IS NOT NULL
+             ),
+             classified AS MATERIALIZED (
+                SELECT h.tx_hash FROM fastauth_health_tx h WHERE h.block_timestamp >= $2
+             )
+             SELECT r.tx_hash, r.signer_account_id, r.block_height, r.block_timestamp
+             FROM recent r
+             WHERE NOT EXISTS (SELECT 1 FROM classified c WHERE c.tx_hash = r.tx_hash)
+             ORDER BY r.block_height DESC
              LIMIT $3`,
-            [this.fastAuthContractIds, lookbackCutoff, DISCOVER_LIMIT],
+            [this.fastAuthContractIds, lookbackCutoff, DISCOVER_LIMIT, DISCOVERY_LOOKBACK_BLOCKS],
         );
 
         if (candidates.length === 0) return { ok: 0, failed: 0, pending: 0 };
