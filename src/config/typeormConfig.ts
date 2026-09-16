@@ -45,7 +45,10 @@ function poolExtra(): Record<string, unknown> {
         max: num(process.env.DB_POOL_MAX, 24),
         ...(disableParallelQuery ? { options: "-c max_parallel_workers_per_gather=0" } : {}),
         statement_timeout: statementTimeoutMs,
-        query_timeout: statementTimeoutMs,
+        // Client-side backstop. Kept above the server statement_timeout so the
+        // dashboard's heavy aggregates, which raise statement_timeout per
+        // transaction (170s), are not cut by the client first.
+        query_timeout: num(process.env.DB_QUERY_TIMEOUT_MS, Math.max(statementTimeoutMs, 180_000)),
         idleTimeoutMillis: num(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30_000),
     };
 }

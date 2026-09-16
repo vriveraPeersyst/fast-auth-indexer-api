@@ -353,6 +353,18 @@ describe("FastauthHealthService", () => {
         });
     });
 
+    it("discovers unclassified txs with a windowed hash anti-join, not a per-row pkey probe", async () => {
+        nearTxRepo.query.mockResolvedValue([]);
+
+        await service.runOnce();
+
+        const [sql, params] = nearTxRepo.query.mock.calls[0];
+        expect(sql).toContain("AS MATERIALIZED");
+        expect(sql).toContain("NOT EXISTS");
+        expect(sql).not.toContain("LEFT JOIN fastauth_health_tx");
+        expect(params[3]).toBeGreaterThan(140_000);
+    });
+
     it("returns status=error when discovery query throws", async () => {
         nearTxRepo.query.mockRejectedValue(new Error("db gone"));
 

@@ -64,6 +64,16 @@ const DASHBOARD_SECTION_CONCURRENCY = 4;
 // fastauth_user_transactions joined to a DISTINCT ON over sign events), so they
 // get a tighter cap of their own.
 const REAL_ACTIVITY_QUERY_CONCURRENCY = 2;
+// All-time / 30-day aggregates over the multi-GB tables (topAccounts,
+// relayerBreakdownByActivity, realActivity) take 10–45s each on the production
+// volume and saturate its IO, starving the indexer's health/pka tasks. They
+// are recomputed at most this often; snapshots in between reuse the last good
+// value. Lighter sections still refresh every 5 minutes.
+const HEAVY_SECTION_REFRESH_MS = 30 * 60 * 1000;
+// Server-side statement timeout for those heavy queries (the pool default is
+// 60s, see typeormConfig). Must stay below the pool's client-side
+// query_timeout.
+const HEAVY_STATEMENT_TIMEOUT_MS = 170_000;
 
 const MAX_RELAYER_ROWS = 30;
 const MAX_UNIQUE_SPONSORED_ACCOUNTS_TO_DISPLAY = 12;
@@ -370,6 +380,7 @@ export class DashboardDataService {
     // all-time failure count to 0 between snapshots. Bounded by the number of
     // sections (~55) and reset on process restart.
     private readonly lastGoodSections = new Map<string, unknown>();
+    private lastHeavyRefreshAtMs = 0;
 
     constructor(
         @InjectRepository(Account) private readonly accountRepo: Repository<Account>,
@@ -427,6 +438,15 @@ export class DashboardDataService {
         // We collect every section via `Promise.allSettled` and degrade
         // rejected slots to typed defaults that preserve the `DashboardData`
         // contract the FastAuth landing page consumes.
+        // Heavy sections run only every HEAVY_SECTION_REFRESH_MS (or until they
+        // have a first good value); otherwise they resolve to that last value.
+        const refreshHeavy = now.getTime() - this.lastHeavyRefreshAtMs >= HEAVY_SECTION_REFRESH_MS;
+        if (refreshHeavy) this.lastHeavyRefreshAtMs = now.getTime();
+        const heavy =
+            <T>(section: string, load: () => Promise<T>) =>
+            (): Promise<T> =>
+                refreshHeavy || !this.lastGoodSections.has(section) ? load() : Promise.resolve(this.lastGoodSections.get(section) as T);
+
         const settled = await settleAllWithConcurrency(
             [
                 () => this.accountRepo.count(),
@@ -461,14 +481,14 @@ export class DashboardDataService {
                 () => this.pkaRepo.count(),
                 () => this.relayerRepo.count(),
                 () => this.checkpointRepo.count(),
-                () => this.loadTopAccounts(last24h, last7d, last30d, MAX_TOP_ACCOUNTS),
+                heavy("topAccounts", () => this.loadTopAccounts(last24h, last7d, last30d, MAX_TOP_ACCOUNTS)),
                 () => this.loadMissingBlockRanges(),
                 () => this.loadFastAuthContracts(),
                 () => this.loadGuardBreakdown(last24h, last7d, last30d),
                 () => this.loadProviderBreakdown(last24h, last7d, last30d),
-                () => this.loadRelayerBreakdownByActivity(last24h, last7d, last30d),
+                heavy("relayerBreakdownByActivity", () => this.loadRelayerBreakdownByActivity(last24h, last7d, last30d)),
                 () => this.loadActionTypeBreakdown(last24h, last7d, last30d),
-                () => this.loadRealActivity(last24h, last7d, last30d),
+                heavy("realActivity", () => this.loadRealActivity(last24h, last7d, last30d)),
             ] as const,
             DASHBOARD_SECTION_CONCURRENCY,
         );
@@ -920,6 +940,18 @@ export class DashboardDataService {
         return defaultValue;
     }
 
+    /**
+     * Runs one heavy aggregate in its own transaction with a longer
+     * `statement_timeout` than the pool default, so it can finish on the slow
+     * production volume instead of being cancelled at 60s (57014).
+     */
+    private heavyQuery<T>(repo: Repository<unknown>, sql: string, params: unknown[]): Promise<T> {
+        return repo.manager.transaction(async (manager) => {
+            await manager.query(`SET LOCAL statement_timeout = ${HEAVY_STATEMENT_TIMEOUT_MS}`);
+            return manager.query(sql, params) as Promise<T>;
+        });
+    }
+
     private resolvePollIntervalMs(): number {
         const raw = this.config.get<string | undefined>("INDEXER_POLL_INTERVAL_MS");
         const parsed = raw ? Number(raw) : NaN;
@@ -1026,7 +1058,7 @@ export class DashboardDataService {
     }
 
     private async loadTopAccounts(last24h: Date, last7d: Date, last30d: Date, limit: number): Promise<TopAccountRow[]> {
-        const rows = await this.signEventRepo.query<
+        const rows = await this.heavyQuery<
             Array<{
                 account_id: string;
                 sign_events_all: string;
@@ -1037,6 +1069,7 @@ export class DashboardDataService {
                 last_event_at: Date | null;
             }>
         >(
+            this.signEventRepo,
             `SELECT
                 user_account_id AS account_id,
                 COUNT(*) AS sign_events_all,
@@ -1537,9 +1570,13 @@ export class DashboardDataService {
         ];
 
         type RelayerRow = { relayer_account_id: string; total: string; failed: string; distinct_users: string };
-        const results = await Promise.all(
-            windows.map((w) =>
-                this.userTxRepo.query<RelayerRow[]>(
+        // Sequential: each window is a join over two multi-GB tables (the 30d
+        // one took 43s alone); running the three at once timed them all out.
+        const results: RelayerRow[][] = [];
+        for (const w of windows) {
+            results.push(
+                await this.heavyQuery<RelayerRow[]>(
+                    this.userTxRepo,
                     `SELECT u.relayer_account_id AS relayer_account_id,
                             COUNT(*) AS total,
                             COUNT(*) FILTER (WHERE h.outcome = 'failure') AS failed,
@@ -1550,8 +1587,8 @@ export class DashboardDataService {
                      GROUP BY u.relayer_account_id`,
                     [w.gte],
                 ),
-            ),
-        );
+            );
+        }
 
         const allKeys = new Set<string>();
         const perWindow = new Map<"last24h" | "last7d" | "last30d", Map<string, GuardWindowStats>>();
@@ -1709,7 +1746,8 @@ export class DashboardDataService {
         const nonCteSettled = await settleAllWithConcurrency(
             [
                 () =>
-                    this.userTxRepo.query<WindowsRow[]>(
+                    this.heavyQuery<WindowsRow[]>(
+                        this.userTxRepo,
                         `SELECT
                     COUNT(*) AS total_all,
                     COUNT(*) FILTER (WHERE u.block_timestamp >= $1) AS total_30d,
@@ -1732,7 +1770,8 @@ export class DashboardDataService {
                         [last30d, last7d, last24h],
                     ),
                 () =>
-                    this.userTxRepo.query<ReceiverOrMethodRow[]>(
+                    this.heavyQuery<ReceiverOrMethodRow[]>(
+                        this.userTxRepo,
                         `SELECT
                     receiver_id AS key,
                     COUNT(*) AS total_all,
@@ -1747,7 +1786,8 @@ export class DashboardDataService {
                         [last30d, last7d, last24h],
                     ),
                 () =>
-                    this.userTxRepo.query<ReceiverOrMethodRow[]>(
+                    this.heavyQuery<ReceiverOrMethodRow[]>(
+                        this.userTxRepo,
                         `SELECT
                     COALESCE(method_name, NULLIF(array_to_string(action_types, '+'), '')) AS key,
                     COUNT(*) AS total_all,
@@ -1768,7 +1808,8 @@ export class DashboardDataService {
                         select: { blockHeight: true, blockTimestamp: true },
                     }),
                 () =>
-                    this.userHealthRepo.query<ReasonRow[]>(
+                    this.heavyQuery<ReasonRow[]>(
+                        this.userHealthRepo,
                         `SELECT
                     SPLIT_PART(failure_reason, ':', 1) AS reason,
                     COUNT(*) AS total_all,
@@ -1795,9 +1836,10 @@ export class DashboardDataService {
         // Batch 1 of 2 (CTE): three `buildClassGroupSql` projections.
         const classGroupSettled = await settleAllWithConcurrency(
             [
-                () => this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("relayer_account_id"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("provider_type"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("guard_name"), [last30d, last7d, last24h]),
+                () =>
+                    this.heavyQuery<ClassGroupRow[]>(this.userTxRepo, buildClassGroupSql("relayer_account_id"), [last30d, last7d, last24h]),
+                () => this.heavyQuery<ClassGroupRow[]>(this.userTxRepo, buildClassGroupSql("provider_type"), [last30d, last7d, last24h]),
+                () => this.heavyQuery<ClassGroupRow[]>(this.userTxRepo, buildClassGroupSql("guard_name"), [last30d, last7d, last24h]),
             ] as const,
             REAL_ACTIVITY_QUERY_CONCURRENCY,
         );
@@ -1809,12 +1851,24 @@ export class DashboardDataService {
         // Batch 2 of 2 (CTE): six `buildCrossSql` cross-classifications.
         const crossSettled = await settleAllWithConcurrency(
             [
-                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "receiver_id"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "method_name"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "receiver_id"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "method_name"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "receiver_id"), [last30d, last7d, last24h]),
-                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "method_name"), [last30d, last7d, last24h]),
+                () =>
+                    this.heavyQuery<CrossRow[]>(this.userTxRepo, buildCrossSql("relayer_account_id", "receiver_id"), [
+                        last30d,
+                        last7d,
+                        last24h,
+                    ]),
+                () =>
+                    this.heavyQuery<CrossRow[]>(this.userTxRepo, buildCrossSql("relayer_account_id", "method_name"), [
+                        last30d,
+                        last7d,
+                        last24h,
+                    ]),
+                () =>
+                    this.heavyQuery<CrossRow[]>(this.userTxRepo, buildCrossSql("provider_type", "receiver_id"), [last30d, last7d, last24h]),
+                () =>
+                    this.heavyQuery<CrossRow[]>(this.userTxRepo, buildCrossSql("provider_type", "method_name"), [last30d, last7d, last24h]),
+                () => this.heavyQuery<CrossRow[]>(this.userTxRepo, buildCrossSql("guard_name", "receiver_id"), [last30d, last7d, last24h]),
+                () => this.heavyQuery<CrossRow[]>(this.userTxRepo, buildCrossSql("guard_name", "method_name"), [last30d, last7d, last24h]),
             ] as const,
             REAL_ACTIVITY_QUERY_CONCURRENCY,
         );
