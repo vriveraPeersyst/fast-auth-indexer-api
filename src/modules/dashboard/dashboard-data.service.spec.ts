@@ -224,6 +224,69 @@ describe("DashboardDataService", () => {
         errorSpy.mockRestore();
     });
 
+    it("reuses the last good value for a section that fails after succeeding once", async () => {
+        const errorSpy = jest.spyOn((service as any).logger, "error").mockImplementation(() => undefined);
+        signEventRepo.count.mockResolvedValue(42);
+
+        const healthy = await service.computeDashboardData();
+        expect(healthy.transactionOverview.total.last24h).toBe(42);
+
+        signEventRepo.count.mockRejectedValue(new Error("canceling statement due to statement timeout"));
+        const degraded = await service.computeDashboardData();
+
+        // Was 0 before: the empty default overwrote the published snapshot.
+        expect(degraded.transactionOverview.total.last24h).toBe(42);
+        expect(errorSpy.mock.calls.some((call) => String(call[1]).includes("reusing last good value"))).toBe(true);
+        errorSpy.mockRestore();
+    });
+
+    it("caps how many fan-out sections hit the database at once", async () => {
+        let inFlight = 0;
+        let peak = 0;
+        const accountRepo = (service as any).accountRepo;
+        const track = async () => {
+            inFlight += 1;
+            peak = Math.max(peak, inFlight);
+            await new Promise((resolve) => setTimeout(resolve, 1));
+            inFlight -= 1;
+            return 0;
+        };
+        for (const repo of [accountRepo, signEventRepo, healthRepo, nearTxRepo, userTxRepo, missingRangeRepo]) {
+            repo.count.mockImplementation(track);
+            repo.find.mockImplementation(async () => {
+                await track();
+                return [];
+            });
+        }
+
+        await service.computeDashboardData();
+
+        expect(peak).toBeGreaterThan(0);
+        expect(peak).toBeLessThanOrEqual(4);
+    });
+
+    it("limits recent failures to the 24h window the label advertises", async () => {
+        healthRepo.find.mockResolvedValue([]);
+
+        await service.computeDashboardData();
+
+        const failureCalls = healthRepo.find.mock.calls.filter((call: any[]) => call[0]?.where?.outcome !== undefined);
+        expect(failureCalls.length).toBeGreaterThan(0);
+        for (const [options] of failureCalls) {
+            expect(options.where.blockTimestamp).toBeDefined();
+        }
+    });
+
+    it("reports all-time active accounts as the indexed accounts, not the migrated total", async () => {
+        const accountRepo = (service as any).accountRepo;
+        accountRepo.count.mockResolvedValue(100);
+
+        const result = await service.computeDashboardData();
+
+        expect(result.accountsOverview.active.all).toBe(100);
+        expect(result.accountsOverview.firstSeen.all).toBe(result.accountsOverview.totalAccounts);
+    });
+
     it("computes blocksProcessed from completedUpTo + completedDownTo cursors", async () => {
         missingRangeRepo.find.mockResolvedValue([
             {

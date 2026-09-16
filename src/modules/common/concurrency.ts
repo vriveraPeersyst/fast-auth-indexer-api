@@ -64,3 +64,29 @@ export async function runWithConcurrencyAbortOnError<T>(
 
     if (failure !== null) throw failure;
 }
+
+/**
+ * `Promise.allSettled` with a concurrency cap. Takes thunks (not promises) so
+ * nothing starts until a worker slot frees up, and preserves both the input
+ * order and the per-task settled shape.
+ *
+ * The dashboard fan-out uses it: firing ~40 heavy aggregate queries at once
+ * made Postgres run each one with parallel workers, which exhausted the
+ * container's /dev/shm ("could not resize shared memory segment") and pushed
+ * the rest past `statement_timeout`. Those sections then published their
+ * empty defaults to the status snapshot.
+ */
+export async function settleAllWithConcurrency<T extends readonly (() => Promise<unknown>)[]>(
+    tasks: T,
+    concurrency: number,
+): Promise<{ -readonly [K in keyof T]: PromiseSettledResult<Awaited<ReturnType<T[K]>>> }> {
+    const results = new Array(tasks.length) as { -readonly [K in keyof T]: PromiseSettledResult<Awaited<ReturnType<T[K]>>> };
+    await runWithConcurrency(tasks as readonly (() => Promise<unknown>)[], concurrency, async (task, index) => {
+        try {
+            (results as PromiseSettledResult<unknown>[])[index] = { status: "fulfilled", value: await task() };
+        } catch (reason) {
+            (results as PromiseSettledResult<unknown>[])[index] = { status: "rejected", reason };
+        }
+    });
+    return results;
+}

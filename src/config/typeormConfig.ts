@@ -21,6 +21,13 @@ export type NestConnectionOptions = DataSourceOptions & {
  *     whose sections already degrade to typed defaults via `Promise.allSettled`
  *     when a slot rejects, so a timed-out section is self-healing (retried next
  *     cycle) rather than a hard failure.
+ *   - `options`: `max_parallel_workers_per_gather=0` disables Postgres parallel
+ *     query for this app's sessions. The dashboard's aggregate queries kept
+ *     failing with `could not resize shared memory segment … No space left on
+ *     device` (53100): parallel workers allocate from the container's small
+ *     /dev/shm, and several concurrent aggregates exhausted it. Serial plans
+ *     are fast enough at this data size and make the snapshot deterministic.
+ *     Set `DB_DISABLE_PARALLEL_QUERY=0` to restore the server default.
  *   - `max`: size the pool explicitly instead of inheriting pg's implicit 10,
  *     which the old on-demand `/status` fan-out (~60 concurrent queries) used
  *     to saturate, starving even the indexer crons in this same process.
@@ -33,8 +40,10 @@ function poolExtra(): Record<string, unknown> {
         return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
     };
     const statementTimeoutMs = num(process.env.DB_STATEMENT_TIMEOUT_MS, 60_000);
+    const disableParallelQuery = process.env.DB_DISABLE_PARALLEL_QUERY !== "0";
     return {
         max: num(process.env.DB_POOL_MAX, 24),
+        ...(disableParallelQuery ? { options: "-c max_parallel_workers_per_gather=0" } : {}),
         statement_timeout: statementTimeoutMs,
         query_timeout: statementTimeoutMs,
         idleTimeoutMillis: num(process.env.DB_POOL_IDLE_TIMEOUT_MS, 30_000),
