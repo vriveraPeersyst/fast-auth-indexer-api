@@ -42,6 +42,7 @@ import {
     TopAccountRow,
     TransactionMetrics,
 } from "./dashboard-data.types";
+import { settleAllWithConcurrency } from "../common/concurrency";
 import { TtlMemo } from "../common/ttl-memo";
 import { MIGRATED_ACCOUNTS_TOTAL } from "./migrated-accounts.constant";
 import { StatusData, StatusFailureDto, StatusUptimeBucket } from "./status.types";
@@ -53,6 +54,16 @@ export const DASHBOARD_DATA_SNAPSHOT_KEY = "dashboard_data";
 // snapshot only changes every ~5 min (cron), so this just collapses request
 // bursts to one SELECT; it is NOT the data-freshness bound.
 const DASHBOARD_READ_TTL_MS = 10_000;
+// Fan-out concurrency. Firing all ~40 sections at once made Postgres plan each
+// aggregate with parallel workers, exhausting the container's /dev/shm (53100
+// "could not resize shared memory segment") and timing out the rest, so those
+// sections published empty defaults. The snapshot job is a 5-minute background
+// task, so serialising most of it costs nothing the landing page can notice.
+const DASHBOARD_SECTION_CONCURRENCY = 4;
+// The realActivity CTEs are the heaviest queries in the fan-out (full scans of
+// fastauth_user_transactions joined to a DISTINCT ON over sign events), so they
+// get a tighter cap of their own.
+const REAL_ACTIVITY_QUERY_CONCURRENCY = 2;
 
 const MAX_RELAYER_ROWS = 30;
 const MAX_UNIQUE_SPONSORED_ACCOUNTS_TO_DISPLAY = 12;
@@ -353,6 +364,13 @@ export class DashboardDataService {
     // just collapses request bursts to one row read.
     private readonly readMemo = new TtlMemo<SnapshotRead>(DASHBOARD_READ_TTL_MS);
 
+    // Last successful value per fan-out section. A section that fails this
+    // cycle reuses it instead of publishing an empty default — those defaults
+    // were what made /status flip "Active · 30d", "Top accounts" and the
+    // all-time failure count to 0 between snapshots. Bounded by the number of
+    // sections (~55) and reset on process restart.
+    private readonly lastGoodSections = new Map<string, unknown>();
+
     constructor(
         @InjectRepository(Account) private readonly accountRepo: Repository<Account>,
         @InjectRepository(Relayer) private readonly relayerRepo: Repository<Relayer>,
@@ -409,48 +427,51 @@ export class DashboardDataService {
         // We collect every section via `Promise.allSettled` and degrade
         // rejected slots to typed defaults that preserve the `DashboardData`
         // contract the FastAuth landing page consumes.
-        const settled = await Promise.allSettled([
-            this.accountRepo.count(),
-            this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last24h) } }),
-            this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last7d) } }),
-            this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last30d) } }),
-            this.accountRepo.count({ where: { lastSeenAt: MoreThanOrEqual(last24h) } }),
-            this.accountRepo.count({ where: { lastSeenAt: MoreThanOrEqual(last7d) } }),
-            this.accountRepo.count({ where: { lastSeenAt: MoreThanOrEqual(last30d) } }),
-            this.signEventRepo.count({ where: { blockTimestamp: MoreThanOrEqual(last24h) } }),
-            this.signEventRepo.count({ where: { blockTimestamp: MoreThanOrEqual(last7d) } }),
-            this.signEventRepo.count({ where: { blockTimestamp: MoreThanOrEqual(last30d) } }),
-            this.loadSignOutcomeCounts(last24h, last7d, last30d),
-            this.checkpointRepo.findOne({ where: { key: "near_last_final_block_height" } }),
-            this.checkpointRepo.findOne({ where: { key: "near_last_scanned_height" } }),
-            this.checkpointRepo.findOne({ where: { key: "near_chain_head_height" } }),
-            this.checkpointRepo.findOne({ where: { key: "near_backfill_start_origin" } }),
-            this.loadChainHealth(now, last24h),
-            this.nearTxRepo.findOne({ where: {}, order: { createdAt: "DESC" } }),
-            this.relayerRepo.find({ order: { totalSignTransactions: "DESC" }, take: MAX_RELAYER_ROWS }),
-            this.loadSponsoredPairs(),
-            this.loadSponsoredPairs(last24h),
-            this.loadSponsoredPairs(last7d),
-            this.loadSponsoredPairs(last30d),
-            this.nearTxRepo.find({ order: { blockTimestamp: "DESC" }, take: MAX_RECENT_NEAR_TRANSACTIONS }),
-            this.signEventRepo.find({ order: { blockTimestamp: "DESC" }, take: MAX_RECENT_SIGN_EVENTS }),
-            this.pkaRepo.find({ order: { lastSeenAt: "DESC" }, take: MAX_PUBLIC_KEY_ACCOUNTS }),
-            this.checkpointRepo.find({ order: { key: "ASC" } }),
-            this.nearTxRepo.count(),
-            this.signEventRepo.count(),
-            this.accountRepo.count(),
-            this.pkaRepo.count(),
-            this.relayerRepo.count(),
-            this.checkpointRepo.count(),
-            this.loadTopAccounts(last24h, last7d, last30d, MAX_TOP_ACCOUNTS),
-            this.loadMissingBlockRanges(),
-            this.loadFastAuthContracts(),
-            this.loadGuardBreakdown(last24h, last7d, last30d),
-            this.loadProviderBreakdown(last24h, last7d, last30d),
-            this.loadRelayerBreakdownByActivity(last24h, last7d, last30d),
-            this.loadActionTypeBreakdown(last24h, last7d, last30d),
-            this.loadRealActivity(last24h, last7d, last30d),
-        ] as const);
+        const settled = await settleAllWithConcurrency(
+            [
+                () => this.accountRepo.count(),
+                () => this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last24h) } }),
+                () => this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last7d) } }),
+                () => this.accountRepo.count({ where: { firstSeenAt: MoreThanOrEqual(last30d) } }),
+                () => this.accountRepo.count({ where: { lastSeenAt: MoreThanOrEqual(last24h) } }),
+                () => this.accountRepo.count({ where: { lastSeenAt: MoreThanOrEqual(last7d) } }),
+                () => this.accountRepo.count({ where: { lastSeenAt: MoreThanOrEqual(last30d) } }),
+                () => this.signEventRepo.count({ where: { blockTimestamp: MoreThanOrEqual(last24h) } }),
+                () => this.signEventRepo.count({ where: { blockTimestamp: MoreThanOrEqual(last7d) } }),
+                () => this.signEventRepo.count({ where: { blockTimestamp: MoreThanOrEqual(last30d) } }),
+                () => this.loadSignOutcomeCounts(last24h, last7d, last30d),
+                () => this.checkpointRepo.findOne({ where: { key: "near_last_final_block_height" } }),
+                () => this.checkpointRepo.findOne({ where: { key: "near_last_scanned_height" } }),
+                () => this.checkpointRepo.findOne({ where: { key: "near_chain_head_height" } }),
+                () => this.checkpointRepo.findOne({ where: { key: "near_backfill_start_origin" } }),
+                () => this.loadChainHealth(now, last24h),
+                () => this.nearTxRepo.findOne({ where: {}, order: { createdAt: "DESC" } }),
+                () => this.relayerRepo.find({ order: { totalSignTransactions: "DESC" }, take: MAX_RELAYER_ROWS }),
+                () => this.loadSponsoredPairs(),
+                () => this.loadSponsoredPairs(last24h),
+                () => this.loadSponsoredPairs(last7d),
+                () => this.loadSponsoredPairs(last30d),
+                () => this.nearTxRepo.find({ order: { blockTimestamp: "DESC" }, take: MAX_RECENT_NEAR_TRANSACTIONS }),
+                () => this.signEventRepo.find({ order: { blockTimestamp: "DESC" }, take: MAX_RECENT_SIGN_EVENTS }),
+                () => this.pkaRepo.find({ order: { lastSeenAt: "DESC" }, take: MAX_PUBLIC_KEY_ACCOUNTS }),
+                () => this.checkpointRepo.find({ order: { key: "ASC" } }),
+                () => this.nearTxRepo.count(),
+                () => this.signEventRepo.count(),
+                () => this.accountRepo.count(),
+                () => this.pkaRepo.count(),
+                () => this.relayerRepo.count(),
+                () => this.checkpointRepo.count(),
+                () => this.loadTopAccounts(last24h, last7d, last30d, MAX_TOP_ACCOUNTS),
+                () => this.loadMissingBlockRanges(),
+                () => this.loadFastAuthContracts(),
+                () => this.loadGuardBreakdown(last24h, last7d, last30d),
+                () => this.loadProviderBreakdown(last24h, last7d, last30d),
+                () => this.loadRelayerBreakdownByActivity(last24h, last7d, last30d),
+                () => this.loadActionTypeBreakdown(last24h, last7d, last30d),
+                () => this.loadRealActivity(last24h, last7d, last30d),
+            ] as const,
+            DASHBOARD_SECTION_CONCURRENCY,
+        );
 
         const accountsTotal = this.unwrapSection(settled[0], "accountsTotal", 0);
         const accountsFirstSeen24h = this.unwrapSection(settled[1], "accountsFirstSeen24h", 0);
@@ -508,7 +529,11 @@ export class DashboardDataService {
                 last24h: accountsActive24h,
                 last7d: accountsActive7d,
                 last30d: accountsActive30d,
-                all: totalAccountsAllTime,
+                // Accounts the indexer has actually seen act (they carry a
+                // last_seen_at). The migrated legacy accounts have no activity
+                // record, so counting them as "active all-time" — which is what
+                // totalAccountsAllTime did here — was not a measurement.
+                all: accountsTotal,
             },
         };
 
@@ -883,7 +908,14 @@ export class DashboardDataService {
      * `/public/status` returning a partial 200 instead of a hard 500.
      */
     private unwrapSection<T>(result: PromiseSettledResult<T>, section: string, defaultValue: T): T {
-        if (result.status === "fulfilled") return result.value;
+        if (result.status === "fulfilled") {
+            this.lastGoodSections.set(section, result.value);
+            return result.value;
+        }
+        if (this.lastGoodSections.has(section)) {
+            this.logger.error({ err: result.reason, section }, "dashboard fan-out: section failed, reusing last good value");
+            return this.lastGoodSections.get(section) as T;
+        }
         this.logger.error({ err: result.reason, section }, "dashboard fan-out: section failed, returning default");
         return defaultValue;
     }
@@ -1161,14 +1193,17 @@ export class DashboardDataService {
         );
         const lastSuccess = lastSuccessRows[0];
 
+        // Scoped to the same 24h window the label advertises ("Last 24h · N
+        // failures"); unscoped, /status listed days-old MPC timeouts under a
+        // "0 failures" heading.
         const recentFastAuthFailures = await this.healthRepo.find({
-            where: { outcome: In(FAILURE_OUTCOMES) },
+            where: { outcome: In(FAILURE_OUTCOMES), blockTimestamp: MoreThanOrEqual(last24h) },
             order: { blockTimestamp: "DESC" },
             take: 5,
             select: { txHash: true, blockTimestamp: true, outcome: true, failingExecutorId: true, failureReason: true },
         });
         const recentMpcFailures = await this.healthRepo.find({
-            where: { outcome: "mpc_failure" },
+            where: { outcome: "mpc_failure", blockTimestamp: MoreThanOrEqual(last24h) },
             order: { blockTimestamp: "DESC" },
             take: 5,
             select: { txHash: true, blockTimestamp: true, outcome: true, failingExecutorId: true, failureReason: true },
@@ -1671,9 +1706,11 @@ export class DashboardDataService {
         // two sequential batches so peak temporary-file pressure is bounded
         // by the larger batch (6) rather than 9, and so a single rejected
         // query degrades only its own slot.
-        const nonCteSettled = await Promise.allSettled([
-            this.userTxRepo.query<WindowsRow[]>(
-                `SELECT
+        const nonCteSettled = await settleAllWithConcurrency(
+            [
+                () =>
+                    this.userTxRepo.query<WindowsRow[]>(
+                        `SELECT
                     COUNT(*) AS total_all,
                     COUNT(*) FILTER (WHERE u.block_timestamp >= $1) AS total_30d,
                     COUNT(*) FILTER (WHERE u.block_timestamp >= $2) AS total_7d,
@@ -1692,10 +1729,11 @@ export class DashboardDataService {
                     COALESCE(SUM(u.value_usd) FILTER (WHERE u.block_timestamp >= $3), 0)::text AS vol_24h
                  FROM fastauth_user_transactions u
                  LEFT JOIN fastauth_user_health_tx h ON h.tx_hash = u.tx_hash`,
-                [last30d, last7d, last24h],
-            ),
-            this.userTxRepo.query<ReceiverOrMethodRow[]>(
-                `SELECT
+                        [last30d, last7d, last24h],
+                    ),
+                () =>
+                    this.userTxRepo.query<ReceiverOrMethodRow[]>(
+                        `SELECT
                     receiver_id AS key,
                     COUNT(*) AS total_all,
                     COUNT(*) FILTER (WHERE block_timestamp >= $1) AS total_30d,
@@ -1706,10 +1744,11 @@ export class DashboardDataService {
                  GROUP BY receiver_id
                  ORDER BY total_all DESC
                  LIMIT 20`,
-                [last30d, last7d, last24h],
-            ),
-            this.userTxRepo.query<ReceiverOrMethodRow[]>(
-                `SELECT
+                        [last30d, last7d, last24h],
+                    ),
+                () =>
+                    this.userTxRepo.query<ReceiverOrMethodRow[]>(
+                        `SELECT
                     COALESCE(method_name, NULLIF(array_to_string(action_types, '+'), '')) AS key,
                     COUNT(*) AS total_all,
                     COUNT(*) FILTER (WHERE block_timestamp >= $1) AS total_30d,
@@ -1720,15 +1759,17 @@ export class DashboardDataService {
                  GROUP BY COALESCE(method_name, NULLIF(array_to_string(action_types, '+'), ''))
                  ORDER BY total_all DESC
                  LIMIT 20`,
-                [last30d, last7d, last24h],
-            ),
-            this.userTxRepo.findOne({
-                where: {},
-                order: { blockTimestamp: "ASC" },
-                select: { blockHeight: true, blockTimestamp: true },
-            }),
-            this.userHealthRepo.query<ReasonRow[]>(
-                `SELECT
+                        [last30d, last7d, last24h],
+                    ),
+                () =>
+                    this.userTxRepo.findOne({
+                        where: {},
+                        order: { blockTimestamp: "ASC" },
+                        select: { blockHeight: true, blockTimestamp: true },
+                    }),
+                () =>
+                    this.userHealthRepo.query<ReasonRow[]>(
+                        `SELECT
                     SPLIT_PART(failure_reason, ':', 1) AS reason,
                     COUNT(*) AS total_all,
                     COUNT(*) FILTER (WHERE block_timestamp >= $1) AS total_30d,
@@ -1739,9 +1780,11 @@ export class DashboardDataService {
                  GROUP BY SPLIT_PART(failure_reason, ':', 1)
                  ORDER BY total_all DESC
                  LIMIT 50`,
-                [last30d, last7d, last24h],
-            ),
-        ] as const);
+                        [last30d, last7d, last24h],
+                    ),
+            ] as const,
+            REAL_ACTIVITY_QUERY_CONCURRENCY,
+        );
 
         const windowsRows = this.unwrapSection(nonCteSettled[0], "realActivity.windowsRows", [] as WindowsRow[]);
         const receiverRows = this.unwrapSection(nonCteSettled[1], "realActivity.receiverRows", [] as ReceiverOrMethodRow[]);
@@ -1750,25 +1793,31 @@ export class DashboardDataService {
         const reasonRows = this.unwrapSection(nonCteSettled[4], "realActivity.reasonRows", [] as ReasonRow[]);
 
         // Batch 1 of 2 (CTE): three `buildClassGroupSql` projections.
-        const classGroupSettled = await Promise.allSettled([
-            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("relayer_account_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("provider_type"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("guard_name"), [last30d, last7d, last24h]),
-        ] as const);
+        const classGroupSettled = await settleAllWithConcurrency(
+            [
+                () => this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("relayer_account_id"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("provider_type"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<ClassGroupRow[]>(buildClassGroupSql("guard_name"), [last30d, last7d, last24h]),
+            ] as const,
+            REAL_ACTIVITY_QUERY_CONCURRENCY,
+        );
 
         const relayerClassRows = this.unwrapSection(classGroupSettled[0], "realActivity.relayerClassRows", [] as ClassGroupRow[]);
         const providerClassRows = this.unwrapSection(classGroupSettled[1], "realActivity.providerClassRows", [] as ClassGroupRow[]);
         const guardClassRows = this.unwrapSection(classGroupSettled[2], "realActivity.guardClassRows", [] as ClassGroupRow[]);
 
         // Batch 2 of 2 (CTE): six `buildCrossSql` cross-classifications.
-        const crossSettled = await Promise.allSettled([
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "receiver_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "method_name"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "receiver_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "method_name"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "receiver_id"), [last30d, last7d, last24h]),
-            this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "method_name"), [last30d, last7d, last24h]),
-        ] as const);
+        const crossSettled = await settleAllWithConcurrency(
+            [
+                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "receiver_id"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("relayer_account_id", "method_name"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "receiver_id"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("provider_type", "method_name"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "receiver_id"), [last30d, last7d, last24h]),
+                () => this.userTxRepo.query<CrossRow[]>(buildCrossSql("guard_name", "method_name"), [last30d, last7d, last24h]),
+            ] as const,
+            REAL_ACTIVITY_QUERY_CONCURRENCY,
+        );
 
         const relayerReceiverRows = this.unwrapSection(crossSettled[0], "realActivity.relayerReceiverRows", [] as CrossRow[]);
         const relayerMethodRows = this.unwrapSection(crossSettled[1], "realActivity.relayerMethodRows", [] as CrossRow[]);
